@@ -6,7 +6,7 @@
 # -Local: מצב התוסף לאפליקציית קלוד (ktiv/bridge/desktop). בלי שרת: משימות מגיעות בשורות JSON בקלט,
 #         ותשובות יוצאות בשורות שמתחילות ב-@@KB@@. תמונות נשמרות בתיקייה ImgDir. יומן: %LOCALAPPDATA%\OtzarBarilanClaude
 param([switch]$Install, [switch]$Run, [switch]$Uninstall, [string]$Server = '', [string]$Key = '', [switch]$Local, [string]$ImgDir = '')
-$VERSION = '2026.11.09.8'
+$VERSION = '2026.11.10.2'
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $HOME_DIR = Join-Path $env:LOCALAPPDATA $(if ($Local) { 'OtzarBarilanClaude' } else { 'KtivBridge' })
@@ -525,7 +525,8 @@ function Responsa-Search($q, $maxHits, $more = $true) {
   $p = Parse-Responsa ([KB]::ResponsaSearch($q, 60))
   $hits = @($p.hits)
   $pages = 0
-  while ($more -and $hits.Count -lt $maxHits -and $p.count -and $hits.Count -lt $p.count -and $pages -lt 8) {
+  # מספר התוצאות לא תמיד נקרא מהכותרת (בדיקה 19): ממשיכים לדפדף עד שאין תוצאות חדשות
+  while ($more -and $hits.Count -lt $maxHits -and $hits.Count -and ($null -eq $p.count -or $hits.Count -lt $p.count) -and $pages -lt 12) {
     $pages++
     $m = Parse-Responsa ([KB]::ResponsaMore(1))
     $new = @($m.hits | Where-Object { $n = $_.n; -not ($hits | Where-Object { $_.n -eq $n }) })
@@ -776,7 +777,7 @@ function Oz-Search($q, $maxBooks) {
   if ($st.desc -match '/\s*([\d,]+)\s+ספרים') { $nb = [int]($matches[1] -replace ',', '') }
   $books = @(); $k = 0
   foreach ($b in @($st.books | Select-Object -First $maxBooks)) { $books += @{ idx = $k; title = $b.title; author = $b.author; n = $b.n }; $k++ }
-  $script:OZ.books = $books
+  $script:OZ.books = $books; $script:OZ.lastq = $q
   return @{ count = $count; books_total = $nb; books = $books; desc = $st.desc }
 }
 
@@ -873,26 +874,49 @@ function Otzar-Auto($vars, $params, [int]$start = 0) {
   $vars = @($vars); if ($start -ge $vars.Count) { $start = $vars.Count - 1 }; if ($start -lt 0) { $start = 0 }
   $r = $null; $used = ''; $vi = -1
   for ($j = $start; $j -lt $vars.Count; $j++) {
-    try { $r = Oz-Search ([string]$vars[$j]) 10 } catch { L ('אוצר החכמה, ניסוח [' + $vars[$j] + ']: ' + $_); $r = $null; continue }
+    try { $r = Oz-Search ([string]$vars[$j]) (List-Max $params 'otzar') } catch { L ('אוצר החכמה, ניסוח [' + $vars[$j] + ']: ' + $_); $r = $null; continue }
     $used = [string]$vars[$j]; $vi = $j
     if ($r.count -gt 0) { break }
   }
   if (-not $r) { return @{ state = 'error'; message = 'החיפוש באוצר החכמה נכשל' } }
-  $out = @{ state = 'ok'; count = $r.count; books_total = $r.books_total; books = @($r.books | Select-Object -First 5); pages = @(); used = $used; vi = $vi }
+  $out = @{ state = 'ok'; count = $r.count; books_total = $r.books_total; books = @($r.books); pages = @(); used = $used; vi = $vi }
   $mode = [string]$params.otzar_result
   $k = [int]$params.auto_books
   if ($mode -eq 'image' -and $k -lt 1) { $k = 1 }
   if ($mode -eq 'ref') { $k = 0 }
-  for ($i = 0; $i -lt $k -and $i -lt $r.books.Count; $i++) {
+  $idx = @(); for ($i = 0; $i -lt [Math]::Min($k, @($r.books).Count); $i++) { $idx += $i }
+  if ($idx.Count) { $out.pages = @(Oz-Pages $idx $mode) }
+  $script:OZ.last = Get-Date
+  return $out
+}
+
+function Oz-Pages($idxs, [string]$mode) {
+  # העמוד שבו נמצא החיפוש, בכל ספר מרשימת התוצאות של החיפוש האחרון (טקסט מזיהוי התווים של אוצר החכמה, או צילום)
+  $pages = @()
+  foreach ($i in @($idxs)) {
     try {
+      $b = $script:OZ.books | Where-Object { $_.idx -eq [int]$i } | Select-Object -First 1
       $pg = Oz-OpenBook $i
       $label = ''; if (@($pg.inputs).Count) { $label = @($pg.inputs)[0] }
-      $one = @{ idx = $i; book_id = $pg.book_id; title = $r.books[$i].title; author = $r.books[$i].author; page = $pg.p; page_label = $label }
-      if ($mode -eq 'text') { $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' }; $one.text = $reg.text }
-      else { $one.image = $pg.image }
-      $out.pages += $one
-    } catch { L ('אוצר החכמה, ספר ' + $i + ': ' + $_) }
+      $one = @{ idx = [int]$i; book_id = $pg.book_id; title = $b.title; author = $b.author; page = $pg.p; page_label = $label }
+      if ($mode -eq 'image') { $one.image = $pg.image }
+      else { $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' }; $one.text = $reg.text }
+      $pages += $one
+    } catch { L ('אוצר החכמה, ספר ' + $i + ': ' + $_); $pages += @{ idx = [int]$i; error = [string]$_ } }
   }
+  return $pages
+}
+
+function Otzar-Books($p) {
+  # עמודים מספרים נוספים מתוך רשימת הספרים של חיפוש: אם החיפוש האחרון היה אחר, מחפשים שוב קודם
+  $q = [string]$p.query
+  if (-not $q) { throw 'חסר הניסוח' }
+  if (Editor-OtzarRunning) { return @{ state = 'busy'; message = 'אוצר החכמה היה פתוח במחשב, ולכן לא חיפשנו בו.' } }
+  $e = Oz-Ensure
+  if ($e -ne 'ok') { return @{ state = 'error'; message = $e } }
+  if ($script:OZ.lastq -ne $q -or -not $script:OZ.books.Count) { [void](Oz-Search $q 40) }
+  $idxs = @($p.books | ForEach-Object { [int]$_ } | Select-Object -First 8)
+  $out = @{ state = 'ok'; used = $q; pages = @(Oz-Pages $idxs ([string]$p.otzar_result)) }
   $script:OZ.last = Get-Date
   return $out
 }
@@ -906,10 +930,17 @@ function Q-Vars($q, [string]$prog) {
   return $v
 }
 
+function List-Max($p, [string]$prog) {
+  # כמה מקומות להביא בכל חיפוש (רשימת כל המקומות; התוסף מציג טקסט מלא רק לראשונים). ברירת מחדל: 4 כמו פעם.
+  $n = [int]$p.list_max; if ($n -le 0) { $n = [int]$p.max_hits }; if ($n -le 0) { $n = 4 }
+  $cap = @{ otzar = 40; responsa = 40; dbs = 300 }[$prog]
+  return [Math]::Min($n, $cap)
+}
+
 function Responsa-Vars($vars, $maxHits) {
   $r = $null
   foreach ($v in @($vars)) {
-    $r = Responsa-Search $v $maxHits $false
+    $r = Responsa-Search $v $maxHits ($maxHits -gt 4)
     if ($r.state -ne 'ok') { return $r }
     $r.used = $v
     if ($r.count -gt 0 -or @($r.hits).Count -gt 0) { break }
@@ -952,14 +983,14 @@ function Run-Batch($job) {
     if ($p.programs.responsa) {
       if ($rskip) { $one.responsa = $rskip }
       else {
-        try { $one.responsa = Responsa-Vars (Q-Vars $q 'responsa') ([int]$p.max_hits) } catch { $one.responsa = @{ state = 'error'; message = [string]$_ } }
+        try { $one.responsa = Responsa-Vars (Q-Vars $q 'responsa') (List-Max $p 'responsa') } catch { $one.responsa = @{ state = 'error'; message = [string]$_ } }
         if ($one.responsa.state -ne 'ok') { $rskip = $one.responsa; if (-not $note) { $note = $one.responsa.message } }
       }
     }
     if ($p.programs.dbs) {
       if ($dskip) { $one.dbs = $dskip }
       else {
-        try { $one.dbs = Dbs-Vars (Q-Vars $q 'dbs') ([int]$p.max_hits) } catch { $one.dbs = @{ state = 'error'; message = [string]$_ } }
+        try { $one.dbs = Dbs-Vars (Q-Vars $q 'dbs') (List-Max $p 'dbs') } catch { $one.dbs = @{ state = 'error'; message = [string]$_ } }
         if ($one.dbs.state -ne 'ok') { $dskip = $one.dbs; if (-not $note) { $note = $one.dbs.message } }
       }
     }
@@ -979,6 +1010,7 @@ function Run-Batch($job) {
 function Run-Job($job) {
   switch ($job.kind) {
     'batch' { return (Run-Batch $job) }
+    'otzar_books' { return (Otzar-Books $job.params) }
     'close' { Oz-Close; [KB]::ResponsaClose(); [KB]::DbsClose(); return @{ ok = $true } }
     'selftest' { return @{ version = $VERSION; caps = (Caps) } }
     default { throw ('סוג משימה לא מוכר: ' + $job.kind) }
