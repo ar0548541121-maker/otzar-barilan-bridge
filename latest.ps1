@@ -6,7 +6,7 @@
 # -Local: מצב התוסף לאפליקציית קלוד (ktiv/bridge/desktop). בלי שרת: משימות מגיעות בשורות JSON בקלט,
 #         ותשובות יוצאות בשורות שמתחילות ב-@@KB@@. תמונות נשמרות בתיקייה ImgDir. יומן: %LOCALAPPDATA%\OtzarBarilanClaude
 param([switch]$Install, [switch]$Run, [switch]$Uninstall, [string]$Server = '', [string]$Key = '', [switch]$Local, [string]$ImgDir = '')
-$VERSION = '2026.11.10.2'
+$VERSION = '2026.11.19.1'
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $HOME_DIR = Join-Path $env:LOCALAPPDATA $(if ($Local) { 'OtzarBarilanClaude' } else { 'KtivBridge' })
@@ -427,6 +427,17 @@ function Api([string]$method, [string]$path, $body = $null, [int]$timeoutSec = 6
   if ($txt) { return ($txt | ConvertFrom-Json) } else { return $null }
 }
 
+# התוצאה נשלחת דחוסה: מסנן אינטרנט במחשב (אתרוג) עצר לפעמים טקסט תורני בדרך והחזיר דף משלו (16.11).
+# שרת ישן בלי הנתיב החדש – שליחה רגילה כמו קודם.
+function Send-Result([string]$id, $obj) {
+  $json = [Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 10 -Compress))
+  $ms = New-Object IO.MemoryStream
+  $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Compress)
+  $gz.Write($json, 0, $json.Length); $gz.Close()
+  try { [void](Api 'POST' ('/bridge-api/result-gz/' + $id) ($ms.ToArray()) 120) }
+  catch { if ([string]$_ -like 'HTTP 405*' -or [string]$_ -like 'HTTP 404 {"detail":"Not Found"}*') { [void](Api 'POST' ('/bridge-api/result/' + $id) $obj 120) } else { throw } }
+}
+
 # ---------------------------------------------------------------- זיהוי התוכנות
 function Find-Responsa {
   $p = Get-Process RESPONSA -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
@@ -706,7 +717,13 @@ $JS_PAGE = @'
  const dots = [...document.querySelectorAll('.search-fs-results .dot .text')].map(x => parseInt(x.innerText, 10)).filter(x => !isNaN(x));
  const ins = [...document.querySelectorAll('input[type=text]')].filter(i => { const r = i.getBoundingClientRect(); return r.width > 0 && r.width < 120 && r.y < 160 && !i.placeholder; }).map(i => i.value);
  const t = (document.body.innerText.match(/מתוך\s+([\d,]+)/) || [])[1];
- return JSON.stringify({href: location.href, book: m ? +m[1] : null, p: m ? +m[2] : null, canvas: cv, hits: dots, inputs: ins, total: t ? +t.replace(/,/g, '') : null, vh: innerHeight}); })()
+ let book = m ? +m[1] : null, p = m ? +m[2] : null, letter = '';
+ // באתר המקוון הכתובת נשארת עם עמוד -1: העמוד והעמוד המודפס נמצאים במצב התוכנה (בדיקה 26)
+ try { const tabs = Object.values((window._store && window._store.state.tabs) || {}).filter(x => x && x.book);
+   const tb = tabs.find(x => x.book === book) || tabs[tabs.length - 1];
+   if (tb) { if (!book) book = tb.book; if (!(p > 0) && tb.page > 0) p = tb.page;
+     const pg = (tb.pages || []).find(x => x.position === p); letter = (pg && pg.pagedata && pg.pagedata[0] && pg.pagedata[0].letter) || ''; } } catch (e) {}
+ return JSON.stringify({href: location.href, book: book, p: p, letter: letter, canvas: cv, hits: dots, inputs: ins, total: t ? +t.replace(/,/g, '') : null, vh: innerHeight}); })()
 '@
 
 function Oz-PageState { return ((Oz-Eval $JS_PAGE) | ConvertFrom-Json) }
@@ -722,7 +739,7 @@ function Oz-WaitRender($beforeHref, [int]$sec = 20) {
 
 function Oz-PageResult($title, $author, $withImage = $true) {
   $s = Oz-PageState
-  $res = @{ book_id = $s.book; p = $s.p; title = $title; author = $author; hits = @($s.hits); inputs = @($s.inputs); total = $s.total }
+  $res = @{ book_id = $s.book; p = $s.p; letter = [string]$s.letter; title = $title; author = $author; hits = @($s.hits); inputs = @($s.inputs); total = $s.total }
   if ($withImage -and $s.canvas) {
     $h = [Math]::Min([double]$s.canvas.h, [double]$s.vh - [Math]::Max(0, [double]$s.canvas.y))
     $res.image = Oz-Upload (Oz-Shot @{ x = $s.canvas.x; y = $s.canvas.y; w = $s.canvas.w; h = $h } 1.5)
@@ -897,10 +914,15 @@ function Oz-Pages($idxs, [string]$mode) {
     try {
       $b = $script:OZ.books | Where-Object { $_.idx -eq [int]$i } | Select-Object -First 1
       $pg = Oz-OpenBook $i
-      $label = ''; if (@($pg.inputs).Count) { $label = @($pg.inputs)[0] }
+      $label = [string]$pg.letter; if (-not $label -and @($pg.inputs).Count) { $label = @($pg.inputs)[0] }
       $one = @{ idx = [int]$i; book_id = $pg.book_id; title = $b.title; author = $b.author; page = $pg.p; page_label = $label }
       if ($mode -eq 'image') { $one.image = $pg.image }
-      else { $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' }; $one.text = $reg.text }
+      else {
+        $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' }
+        # בדיקה 26: הקריאה הראשונה אחרי פתיחת הדפדפן חזרה ריקה – מנסים שוב פעם אחת
+        if (-not $reg.text) { Start-Sleep -Milliseconds 1500; $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' } }
+        $one.text = $reg.text; if ($reg.text_error) { $one.text_error = $reg.text_error }
+      }
       $pages += $one
     } catch { L ('אוצר החכמה, ספר ' + $i + ': ' + $_); $pages += @{ idx = [int]$i; error = [string]$_ } }
   }
@@ -1007,11 +1029,201 @@ function Run-Batch($job) {
 }
 
 # ---------------------------------------------------------------- משימות
+# ---------------------------------------------------------------- אוצר החכמה המקוון (tablet.otzar.org)
+# בשביל ההכרעה מול הדפוס בהגהה (השרת: ktiv/sources/otzar_online.py, משימה 'otzar_online'). אסתר 15.11.2026:
+# החיבור דרך כרום במחשב שלה, והיא נכנסת למנוי בעצמה – בלי סיסמה בשרת. כרום לא מאפשר שליטה בפרופיל הראשי
+# (מגרסה 136 התעלמות מ-remote-debugging-port בפרופיל ברירת המחדל), ולכן פרופיל נפרד של הגשר: הכניסה למנוי
+# נשמרת בו, במחשב בלבד. הלשוניות והחלונות של אסתר לא נוגעים.
+# החיפוש: אותו קוד של אוצר החכמה שבמחשב (Oz-Search, Oz-Pages) – האתר הוא אותה תוכנה; רק הדפדפן אחר.
+$script:OZO = @{ pid = 0; port = 0; tmp = $null; desk = [IntPtr]::Zero; cdp = $null; target = $null; last = [datetime]::MinValue; books = @(); login = 0 }
+$OZO_URL = 'https://tablet.otzar.org/'
+$OZO_PROFILE = Join-Path $env:LOCALAPPDATA 'KtivBridge\otzar-online'
+
+function Find-Chrome {
+  foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe')) {
+    try { $p = (Get-ItemProperty -LiteralPath $k -ErrorAction Stop).'(default)'; if ($p -and (Test-Path -LiteralPath $p)) { return $p } } catch {}
+  }
+  foreach ($p in @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
+                   "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe")) {
+    if ($p -and (Test-Path -LiteralPath $p)) { return $p }
+  }
+  return $null
+}
+
+function Ozo-Procs {
+  # תהליכי הדפדפן שמשתמשים בפרופיל של הגשר (גם חלון הכניסה הגלוי)
+  $prof = $OZO_PROFILE
+  return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($prof) })
+}
+
+function Ozo-Close {
+  if ($script:OZO.cdp) { try { $script:OZO.cdp.Dispose() } catch {} }
+  if ($script:OZO.pid) { Ozo-Procs | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} } }
+  if ($script:OZO.desk -ne [IntPtr]::Zero) { Start-Sleep -Milliseconds 800; [void][KB]::CloseDesk($script:OZO.desk) }
+  $login = $script:OZO.login
+  $script:OZO = @{ pid = 0; port = 0; tmp = $null; desk = [IntPtr]::Zero; cdp = $null; target = $null; last = [datetime]::MinValue; books = @(); login = $login }
+}
+
+function Ozo-Ensure {
+  if ($script:OZO.pid -and [KB]::Alive($script:OZO.pid) -and $script:OZO.cdp -and $script:OZO.cdp.Open) { return 'ok' }
+  Ozo-Close
+  $exe = Find-Chrome
+  if (-not $exe) { return 'לא נמצא כרום או Edge במחשב' }
+  if (@(Ozo-Procs).Count) { return 'login-open' }   # חלון הכניסה למנוי עדיין פתוח: לא נוגעים בו
+  New-Item -ItemType Directory -Force -Path $OZO_PROFILE | Out-Null
+  $port = Get-Random -Minimum 9400 -Maximum 9459
+  $desk = [KB]::NewDesk('ktivbridge_w')
+  $script:OZO.port = $port; $script:OZO.desk = $desk
+  $cl = '--remote-debugging-port=' + $port + ' --user-data-dir="' + $OZO_PROFILE + '" --no-first-run --no-default-browser-check --disable-gpu --window-size=1600,1100 ' + $OZO_URL
+  $script:OZO.pid = [KB]::Launch($exe, $cl, (Split-Path -Parent $exe), 'ktivbridge_w')
+  if ($script:OZO.pid -le 0) { Ozo-Close; return 'הדפדפן לא נפתח' }
+  $t = $null
+  for ($i = 0; $i -lt 60; $i++) {
+    Start-Sleep -Seconds 1
+    try { $arr = (New-Object Net.WebClient).DownloadString('http://127.0.0.1:' + $port + '/json/list') | ConvertFrom-Json } catch { continue }
+    $t = @(@($arr) | ForEach-Object { $_ } | Where-Object { $_.type -eq 'page' -and $_.url -match 'otzar\.org' -and $_.webSocketDebuggerUrl }) | Select-Object -First 1
+    if ($t -and $t.url -notmatch '#/loading') { break }
+  }
+  if (-not $t) { Ozo-Close; return 'אוצר החכמה המקוון לא נטען' }
+  $script:OZO.target = $t
+  $script:OZO.cdp = [KB+Cdp]::new($t.webSocketDebuggerUrl)
+  [void]$script:OZO.cdp.Send('Emulation.setFocusEmulationEnabled', '{"enabled":true}', 5000)
+  [void]$script:OZO.cdp.Send('Emulation.setDeviceMetricsOverride', '{"width":1280,"height":1700,"deviceScaleFactor":1.5,"mobile":false}', 5000)
+  for ($i = 0; $i -lt 40; $i++) {
+    Start-Sleep -Milliseconds 500
+    $ok = $null; try { $ok = Ozo-Eval '!!window._store && !!document.querySelector("input[id^=fs_input]")' } catch {}
+    if ($ok) { break }
+  }
+  $script:OZO.last = Get-Date
+  return 'ok'
+}
+
+function Ozo-Eval([string]$expr) {
+  $r = $script:OZO.cdp.Send('Runtime.evaluate', ('{"expression":' + [KB]::J($expr) + ',"returnByValue":true,"awaitPromise":true}'), 30000) | ConvertFrom-Json
+  return $r.result.result.value
+}
+
+function Ozo-Login {
+  # אורח: פותחים חלון גלוי של אותו פרופיל באתר, ואסתר נכנסת למנוי בעצמה. פעם בשעה לכל היותר.
+  Ozo-Close
+  if (((Get-Date) - [datetime]$script:OZO.login).TotalMinutes -lt 60 -and $script:OZO.login) { return }
+  $exe = Find-Chrome
+  if (-not $exe) { return }
+  Start-Process -FilePath $exe -ArgumentList @('--user-data-dir="' + $OZO_PROFILE + '"', '--no-first-run', '--no-default-browser-check', '--new-window', $OZO_URL) | Out-Null
+  $script:OZO.login = Get-Date
+  L 'אוצר החכמה המקוון: נפתח חלון כניסה למנוי (פעם אחת; אחרי הכניסה סוגרים את החלון)'
+}
+
+# 16.11 (אסתר: "לרוב די בחיפוש בתוך אותו ספר"): חיפוש רק בספרים ששמם כשם הספר שצוין – מסננים את רשימת הספרים
+# בשם הספר (התיבה "חפש שם ספר או מחבר"), ובוחרים "ברשימה נוכחית" ליד תיבת החיפוש. אחרי החיפוש – חוזרים ל"בכל הספרים".
+$JS_SCOPE = @'
+((want) => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+ const combo = [...document.querySelectorAll('.FSFilterCombo')].find(vis); if (!combo) return 'nocombo';
+ const cur = (combo.querySelector('.selected-text') || {}).innerText || ''; if (cur.trim() === want) return 'ok';
+ combo.click();
+ const it = [...document.querySelectorAll('.combo-item')].find(e => (e.innerText || '').trim() === want); if (!it) return 'noitem';
+ it.click(); return 'ok'; })
+'@
+
+function Ozo-ListFilter([string]$name) {
+  $r = Ozo-Eval @'
+(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+ const e = [...document.querySelectorAll('input[id^="bs_input"]')].find(vis) || [...document.querySelectorAll('input')].find(x => vis(x) && /שם ספר או מחבר/.test(x.placeholder || ''));
+ if (!e) return 'none'; e.focus(); e.select(); return 'ok'; })()
+'@
+  if ($r -ne 'ok') { return $false }
+  if ($name) { [void]$script:OZO.cdp.Send('Input.insertText', ('{"text":' + [KB]::J($name) + '}'), 5000) }
+  else { [void]$script:OZO.cdp.Send('Input.dispatchKeyEvent', '{"type":"keyDown","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8}', 5000)
+         [void]$script:OZO.cdp.Send('Input.dispatchKeyEvent', '{"type":"keyUp","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8}', 5000) }
+  Start-Sleep -Milliseconds 2500
+  return $true
+}
+
+function Otzar-Online($p) {
+  $q = [string]$p.query
+  if (-not $q.Trim()) { throw 'חסר הניסוח' }
+  $e = Ozo-Ensure
+  if ($e -eq 'login-open') { return @{ state = 'login'; message = 'חלון הכניסה לאוצר החכמה המקוון פתוח במחשב: היכנסו למנוי וסגרו אותו' } }
+  if ($e -ne 'ok') { return @{ state = 'error'; message = $e } }
+  $guest = Ozo-Eval '(() => { const u = window._store && window._store.state.user; return !u || !u.fullname || /אורח/.test(u.fullname); })()'
+  if ($guest) {
+    Ozo-Login
+    return @{ state = 'login'; message = 'צריך להיכנס פעם אחת לאוצר החכמה המקוון בחלון שנפתח במחשב' }
+  }
+  # אותו קוד של אוצר החכמה שבמחשב, על הדפדפן של האתר
+  $saved = $script:OZ; $script:OZ = $script:OZO
+  $scoped = $false
+  try {
+    $pref = [string]$p.prefer
+    if ($pref.Trim().Length -ge 3 -and (Ozo-ListFilter $pref)) {
+      $sc = Ozo-Eval ($JS_SCOPE + '(' + [KB]::J('ברשימה נוכחית') + ')')
+      $scoped = ($sc -eq 'ok')
+      if (-not $scoped) { [void](Ozo-ListFilter '') }
+    }
+    $r = Oz-Search $q 40
+    if ($scoped -and -not @($r.books).Count) {               # הספר לא נמצא באתר, או המילים לא בו – חיפוש רגיל
+      [void](Ozo-Eval ($JS_SCOPE + '(' + [KB]::J('בכל הספרים') + ')')); [void](Ozo-ListFilter ''); $scoped = $false
+      $r = Oz-Search $q 40; $r.in_book = $false
+    } elseif ($scoped) { $r.in_book = $true }
+    $n = [Math]::Max(0, [Math]::Min([int]$p.books, 5))
+    # 16.11: הספר שצוין (prefer) – קודם הוא מתוך 40 התוצאות, ורק אחר כך הראשונים ברשימה
+    $idx = @(); $pref = ([string]$p.prefer) -replace '["''\u05F3\u05F4\s]', ''
+    if ($pref.Length -ge 3) {
+      foreach ($b in @($r.books)) {
+        $tk = ([string]$b.title) -replace '["''\u05F3\u05F4\s]', ''
+        if ($tk.Contains($pref) -and $idx.Count -lt $n) { $idx += [int]$b.idx }
+      }
+    }
+    for ($i = 0; $i -lt @($r.books).Count -and $idx.Count -lt $n; $i++) { if ($idx -notcontains $i) { $idx += $i } }
+    $pages = @(); if ($idx.Count) { $pages = @(Oz-Pages $idx 'text') }
+    $out = @{ state = 'ok'; count = $r.count; books_total = $r.books_total; books = @($r.books); pages = $pages; in_book = [bool]$r.in_book }
+  } finally {
+    if ($scoped) { try { [void](Ozo-Eval ($JS_SCOPE + '(' + [KB]::J('בכל הספרים') + ')')); [void](Ozo-ListFilter '') } catch {} }
+    $script:OZO = $script:OZ; $script:OZ = $saved
+  }
+  $script:OZO.last = Get-Date
+  return $out
+}
+
+function Otzar-Online-Pages($p) {
+  # 19.11 (אסתר): דפדוף – n עמודים רצופים מעמוד page בספר book_id, טקסט מזיהוי התווים של אוצר החכמה, רק בפרופיל של הגשר
+  $book = [int]$p.book_id; $page = [int]$p.page; $n = [Math]::Max(1, [Math]::Min([int]$p.n, 10))
+  if ($book -le 0 -or $page -le 0) { throw 'חסר מספר ספר או עמוד' }
+  $e = Ozo-Ensure
+  if ($e -eq 'login-open') { return @{ state = 'login'; message = 'חלון הכניסה לאוצר החכמה המקוון פתוח במחשב: היכנסו למנוי וסגרו אותו' } }
+  if ($e -ne 'ok') { return @{ state = 'error'; message = $e } }
+  $guest = Ozo-Eval '(() => { const u = window._store && window._store.state.user; return !u || !u.fullname || /אורח/.test(u.fullname); })()'
+  if ($guest) { Ozo-Login; return @{ state = 'login'; message = 'צריך להיכנס פעם אחת לאוצר החכמה המקוון בחלון שנפתח במחשב' } }
+  $saved = $script:OZ; $script:OZ = $script:OZO
+  $pages = @(); $title = ''
+  try {
+    for ($k = 0; $k -lt $n; $k++) {
+      $pp = $page + $k
+      try {
+        $before = Oz-Eval 'location.href'
+        [void](Oz-Eval ('(() => { location.hash = "#/b/' + $book + '/p/' + $pp + '"; return 1; })()'))
+        $st = Oz-WaitRender $before 25
+        if ([int]$st.book -ne $book) { throw ('הספר לא נפתח (' + $st.book + ')') }
+        if (-not $title) { $title = [string](Oz-Eval '(() => { try { const t = Object.values(window._store.state.tabs || {}).filter(x => x && x.book); const b = t[t.length - 1]; return (b && (b.name || b.title || b.bookName)) || document.title || ""; } catch (e) { return document.title || ""; } })()') }
+        $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' }
+        if (-not $reg.text) { Start-Sleep -Milliseconds 1500; $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' } }
+        $label = [string]$st.letter; if (-not $label -and @($st.inputs).Count) { $label = @($st.inputs)[0] }
+        $one = @{ page = $pp; page_label = $label; text = $reg.text }; if ($reg.text_error) { $one.text_error = $reg.text_error }
+        $pages += $one
+      } catch { L ('אוצר החכמה המקוון, דפדוף ' + $book + '/' + $pp + ': ' + $_); $pages += @{ page = $pp; error = [string]$_ } }
+    }
+  } finally { $script:OZO = $script:OZ; $script:OZ = $saved }
+  $script:OZO.last = Get-Date
+  return @{ state = 'ok'; book_id = $book; title = $title; pages = $pages }
+}
+
 function Run-Job($job) {
   switch ($job.kind) {
     'batch' { return (Run-Batch $job) }
     'otzar_books' { return (Otzar-Books $job.params) }
-    'close' { Oz-Close; [KB]::ResponsaClose(); [KB]::DbsClose(); return @{ ok = $true } }
+    'otzar_online' { return (Otzar-Online $job.params) }
+    'otzar_online_pages' { return (Otzar-Online-Pages $job.params) }
+    'close' { Oz-Close; Ozo-Close; [KB]::ResponsaClose(); [KB]::DbsClose(); return @{ ok = $true } }
     'selftest' { return @{ version = $VERSION; caps = (Caps) } }
     default { throw ('סוג משימה לא מוכר: ' + $job.kind) }
   }
@@ -1026,6 +1238,7 @@ function Housekeeping {
   }
   if ([KB]::RPid -and ((Get-Date) - $script:RS.last).TotalSeconds -gt 300) { L 'בר אילן: סגירה אחרי 5 דקות בלי שימוש'; [KB]::ResponsaClose() }
   if ([KB]::DPid -and ((Get-Date) - $script:DS.last).TotalSeconds -gt 300) { L 'התקליטור התורני: סגירה אחרי 5 דקות בלי שימוש'; [KB]::DbsClose() }
+  if ($script:OZO.pid -and ((Get-Date) - $script:OZO.last).TotalSeconds -gt 300) { L 'אוצר החכמה המקוון: סגירה אחרי 5 דקות בלי שימוש'; Ozo-Close }
 }
 
 function Clean-Old {
@@ -1040,7 +1253,7 @@ function Self-Update($want) {
     if ($txt -notmatch '\$VERSION = ') { return }
     [IO.File]::WriteAllText($SELF, $txt, (New-Object Text.UTF8Encoding($true)))
     L ('עודכן לגרסה ' + $want + '; מפעיל מחדש')
-    Oz-Close; [KB]::ResponsaClose(); [KB]::DbsClose()
+    Oz-Close; Ozo-Close; [KB]::ResponsaClose(); [KB]::DbsClose()
     Start-Process wscript.exe -ArgumentList ('"' + $VBS + '"')
     exit
   } catch { L ('עדכון נכשל: ' + $_) }
@@ -1091,7 +1304,7 @@ if ($Local) {
       Out-Local @{ id = $job.id; error = [string]$_ }
     }
   }
-  try { Oz-Close } catch {}; try { [KB]::ResponsaClose() } catch {}; try { [KB]::DbsClose() } catch {}
+  try { Oz-Close } catch {}; try { Ozo-Close } catch {}; try { [KB]::ResponsaClose() } catch {}; try { [KB]::DbsClose() } catch {}
   L 'התוסף נסגר'
   exit
 }
@@ -1146,7 +1359,7 @@ if ($Run) {
         L ('משימה ' + $job.kind + ' ' + $job.id)
         try {
           $res = Run-Job $job
-          [void](Api 'POST' ('/bridge-api/result/' + $job.id) @{ result = $res } 120)
+          Send-Result $job.id @{ result = $res }
           L ('  הסתיימה תוך ' + [int]((Get-Date) - $t0).TotalSeconds + ' שניות')
         } catch {
           L ('  שגיאה: ' + $_ + ' @ ' + $_.InvocationInfo.ScriptLineNumber)
