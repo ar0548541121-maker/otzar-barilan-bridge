@@ -6,7 +6,7 @@
 # -Local: מצב התוסף לאפליקציית קלוד (ktiv/bridge/desktop). בלי שרת: משימות מגיעות בשורות JSON בקלט,
 #         ותשובות יוצאות בשורות שמתחילות ב-@@KB@@. תמונות נשמרות בתיקייה ImgDir. יומן: %LOCALAPPDATA%\OtzarBarilanClaude
 param([switch]$Install, [switch]$Run, [switch]$Uninstall, [string]$Server = '', [string]$Key = '', [switch]$Local, [string]$ImgDir = '')
-$VERSION = '2026.11.19.2'
+$VERSION = '2026.11.19.3'
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $HOME_DIR = Join-Path $env:LOCALAPPDATA $(if ($Local) { 'OtzarBarilanClaude' } else { 'KtivBridge' })
@@ -1186,17 +1186,19 @@ function Otzar-Online($p) {
 }
 
 $JS_GOPOS = @'
-((pos) => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
- const lab = [...document.querySelectorAll('*')].find(e => e.children.length === 0 && vis(e) && /^מתוך\s*[\d,]+$/.test((e.innerText || '').trim()));
- let w = lab, inp = null;
- for (let i = 0; i < 5 && w && !inp; i++) { w = w.parentElement; if (w) inp = [...w.querySelectorAll('input')].find(vis); }
- if (!inp) return 'none'; inp.focus(); inp.select(); return 'ok'; })
+((cur) => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+ const small = [...document.querySelectorAll('input')].filter(i => { const r = i.getBoundingClientRect(); return vis(i) && r.width < 120 && r.y < 260 && !i.placeholder; });
+ let inp = small.find(i => String(i.value).trim() === String(cur));
+ if (!inp) { const lab = [...document.querySelectorAll('*')].find(e => e.children.length === 0 && vis(e) && /מתוך/.test(e.innerText || '') && (e.innerText || '').length < 25);
+   let w = lab; for (let i = 0; i < 5 && w && !inp; i++) { w = w.parentElement; if (w) inp = [...w.querySelectorAll('input')].find(vis); } }
+ if (!inp) return 'none:' + small.map(i => i.value).join('|'); inp.focus(); inp.select(); return 'ok'; })
 '@
 
 function Ozo-GoPos([int]$pos) {
   # כמו אדם: מקלידים את מספר העמוד בתיבה "… מתוך N" שבסרגל הספר ולוחצים Enter (באתר המקוון הכתובת לא נושאת את העמוד)
-  $r = Oz-Eval ($JS_GOPOS + '(' + $pos + ')')
-  if ($r -ne 'ok') { throw 'תיבת מספר העמוד לא נמצאה' }
+  $cur = (Oz-PageState).p
+  $r = Oz-Eval ($JS_GOPOS + '(' + [KB]::J([string]$cur) + ')')
+  if ($r -ne 'ok') { throw ('תיבת מספר העמוד לא נמצאה (' + $r + ')') }
   $before = Oz-Eval 'location.href'
   [void](Oz-Send 'Input.insertText' ('{"text":"' + $pos + '"}'))
   [void](Oz-Send 'Input.dispatchKeyEvent' '{"type":"rawKeyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"nativeVirtualKeyCode":13}')
