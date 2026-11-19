@@ -6,7 +6,7 @@
 # -Local: מצב התוסף לאפליקציית קלוד (ktiv/bridge/desktop). בלי שרת: משימות מגיעות בשורות JSON בקלט,
 #         ותשובות יוצאות בשורות שמתחילות ב-@@KB@@. תמונות נשמרות בתיקייה ImgDir. יומן: %LOCALAPPDATA%\OtzarBarilanClaude
 param([switch]$Install, [switch]$Run, [switch]$Uninstall, [string]$Server = '', [string]$Key = '', [switch]$Local, [string]$ImgDir = '')
-$VERSION = '2026.11.19.1'
+$VERSION = '2026.11.19.2'
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $HOME_DIR = Join-Path $env:LOCALAPPDATA $(if ($Local) { 'OtzarBarilanClaude' } else { 'KtivBridge' })
@@ -1185,9 +1185,35 @@ function Otzar-Online($p) {
   return $out
 }
 
+$JS_GOPOS = @'
+((pos) => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+ const lab = [...document.querySelectorAll('*')].find(e => e.children.length === 0 && vis(e) && /^מתוך\s*[\d,]+$/.test((e.innerText || '').trim()));
+ let w = lab, inp = null;
+ for (let i = 0; i < 5 && w && !inp; i++) { w = w.parentElement; if (w) inp = [...w.querySelectorAll('input')].find(vis); }
+ if (!inp) return 'none'; inp.focus(); inp.select(); return 'ok'; })
+'@
+
+function Ozo-GoPos([int]$pos) {
+  # כמו אדם: מקלידים את מספר העמוד בתיבה "… מתוך N" שבסרגל הספר ולוחצים Enter (באתר המקוון הכתובת לא נושאת את העמוד)
+  $r = Oz-Eval ($JS_GOPOS + '(' + $pos + ')')
+  if ($r -ne 'ok') { throw 'תיבת מספר העמוד לא נמצאה' }
+  $before = Oz-Eval 'location.href'
+  [void](Oz-Send 'Input.insertText' ('{"text":"' + $pos + '"}'))
+  [void](Oz-Send 'Input.dispatchKeyEvent' '{"type":"rawKeyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"nativeVirtualKeyCode":13}')
+  [void](Oz-Send 'Input.dispatchKeyEvent' '{"type":"char","key":"Enter","text":"\r","unmodifiedText":"\r","windowsVirtualKeyCode":13}')
+  [void](Oz-Send 'Input.dispatchKeyEvent' '{"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"nativeVirtualKeyCode":13}')
+  for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Milliseconds 700
+    $s = Oz-PageState
+    if ([int]$s.p -eq $pos -and $s.canvas) { Start-Sleep -Milliseconds 1500; return (Oz-PageState) }
+  }
+  return (Oz-PageState)
+}
+
 function Otzar-Online-Pages($p) {
-  # 19.11 (אסתר): דפדוף – n עמודים רצופים מעמוד page בספר book_id, טקסט מזיהוי התווים של אוצר החכמה, רק בפרופיל של הגשר
-  $book = [int]$p.book_id; $page = [int]$p.page; $n = [Math]::Max(1, [Math]::Min([int]$p.n, 10))
+  # 19.11 (אסתר): דפדוף – n עמודים רצופים מעמוד page בספר book_id, טקסט מזיהוי התווים של אוצר החכמה, רק בפרופיל של הגשר.
+  # אם הספר לא פתוח – פותחים אותו דרך החיפוש שמצא אותו (query), ואז עוברים לעמוד בתיבת מספר העמוד.
+  $book = [int]$p.book_id; $page = [int]$p.page; $n = [Math]::Max(1, [Math]::Min([int]$p.n, 10)); $q = [string]$p.query
   if ($book -le 0 -or $page -le 0) { throw 'חסר מספר ספר או עמוד' }
   $e = Ozo-Ensure
   if ($e -eq 'login-open') { return @{ state = 'login'; message = 'חלון הכניסה לאוצר החכמה המקוון פתוח במחשב: היכנסו למנוי וסגרו אותו' } }
@@ -1197,14 +1223,21 @@ function Otzar-Online-Pages($p) {
   $saved = $script:OZ; $script:OZ = $script:OZO
   $pages = @(); $title = ''
   try {
+    $cur = Oz-PageState
+    if ([int]$cur.book -ne $book) {
+      if (-not $q.Trim()) { return @{ state = 'error'; message = 'הספר לא פתוח – צריך את הניסוח שמצא אותו (query)' } }
+      $r = Oz-Search $q 40; $ok = $false
+      for ($i = 0; $i -lt [Math]::Min(8, @($r.books).Count); $i++) {
+        try { $pg = Oz-OpenBook $i; if ([int]$pg.book_id -eq $book) { $ok = $true; $title = [string]$r.books[$i].title; break } } catch { L ('דפדוף: פתיחת ספר ' + $i + ': ' + $_) }
+      }
+      if (-not $ok) { return @{ state = 'error'; message = 'הספר לא נמצא בתוצאות החיפוש (נסו ניסוח אחר מהעמוד)' } }
+    }
     for ($k = 0; $k -lt $n; $k++) {
       $pp = $page + $k
       try {
-        $before = Oz-Eval 'location.href'
-        [void](Oz-Eval ('(() => { location.hash = "#/b/' + $book + '/p/' + $pp + '"; return 1; })()'))
-        $st = Oz-WaitRender $before 25
-        if ([int]$st.book -ne $book) { throw ('הספר לא נפתח (' + $st.book + ')') }
-        if (-not $title) { $title = [string](Oz-Eval '(() => { try { const t = Object.values(window._store.state.tabs || {}).filter(x => x && x.book); const b = t[t.length - 1]; return (b && (b.name || b.title || b.bookName)) || document.title || ""; } catch (e) { return document.title || ""; } })()') }
+        $st = Oz-PageState
+        if ([int]$st.p -ne $pp -or -not $st.canvas) { $st = Ozo-GoPos $pp }
+        if ([int]$st.p -ne $pp) { throw ('לא עבר לעמוד ' + $pp + ' (נשאר ב-' + $st.p + ')') }
         $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' }
         if (-not $reg.text) { Start-Sleep -Milliseconds 1500; $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' } }
         $label = [string]$st.letter; if (-not $label -and @($st.inputs).Count) { $label = @($st.inputs)[0] }
