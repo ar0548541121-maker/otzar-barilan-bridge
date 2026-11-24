@@ -6,7 +6,7 @@
 # -Local: מצב התוסף לאפליקציית קלוד (ktiv/bridge/desktop). בלי שרת: משימות מגיעות בשורות JSON בקלט,
 #         ותשובות יוצאות בשורות שמתחילות ב-@@KB@@. תמונות נשמרות בתיקייה ImgDir. יומן: %LOCALAPPDATA%\OtzarBarilanClaude
 param([switch]$Install, [switch]$Run, [switch]$Uninstall, [string]$Server = '', [string]$Key = '', [switch]$Local, [string]$ImgDir = '')
-$VERSION = '2026.11.19.3'
+$VERSION = '2026.11.24.1'
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $HOME_DIR = Join-Path $env:LOCALAPPDATA $(if ($Local) { 'OtzarBarilanClaude' } else { 'KtivBridge' })
@@ -461,16 +461,48 @@ function Otzar-Procs {
   foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='otzar.exe'" -ErrorAction SilentlyContinue)) {
     if ($mine -and $p.CommandLine -and $p.CommandLine.Contains($mine)) { continue }
     $win = $false; try { $win = ((Get-Process -Id $p.ProcessId -ErrorAction Stop).MainWindowHandle -ne [IntPtr]::Zero) } catch {}
-    $kind = ''; if ($p.CommandLine -match '--type=(\S+)') { $kind = $matches[1] }
-    $old = [bool]($p.CommandLine -and $p.CommandLine -match 'ktiv-otzar-')   # עותק נסתר שלנו שנשאר מהפעלה קודמת
-    $out += @{ pid = [int]$p.ProcessId; window = $win; type = $kind; orphan = $old }
+    $cl = [string]$p.CommandLine
+    $kind = ''; if ($cl -match '--type=(\S+)') { $kind = $matches[1] }
+    # (24.11) עותק נסתר של גשר: "שנשאר" רק אם הגשר שפתח אותו כבר לא רץ. קודם כל עותק שלא שלנו נסגר – ובמחשב עם כמה גשרים
+    # (התוסף בכמה חלונות של קלוד, וגשר כתיב מלא) כל גשר סגר לאחר את אוצר החכמה באמצע חיפוש ("Send ... errors occurred").
+    $br = $cl -match 'ktiv-otzar-'; $owner = 0; $port = 0
+    if ($cl -match 'ktiv-otzar-(\d+)-') { $owner = [int]$matches[1] }
+    if ($cl -match '--remote-debugging-port=(\d+)') { $port = [int]$matches[1] }
+    $old = $false
+    if ($br) {
+      if ($owner) { $old = ($owner -eq $PID) -or -not [KB]::Alive($owner) }
+      else { try { $old = ((Get-Date) - $p.CreationDate).TotalMinutes -gt 30 } catch { $old = $true } }   # גשר בגרסה קודמת (בלי מספר תהליך בשם)
+    }
+    $out += @{ pid = [int]$p.ProcessId; window = ($win -and -not $br); type = $kind; orphan = $old; bridge = $br; owner = $owner; port = $port }
   }
   return $out
 }
 function Editor-OtzarRunning {
   # אוצר החכמה פתוח אצל העורך = יש לו חלון. תהליך בלי חלון (שנשאר ברקע) לא נחשב פתוח (בדיקה 19: תהליך אחד בלי חלון
   # נחשב פתוח, ואוצר החכמה דולג). אם התהליך הזה בכל זאת חוסם את העותק שלנו, Oz-Ensure מדווח על כך.
-  return [bool](@(Otzar-Procs | Where-Object { $_.window }).Count)
+  return [bool](@(Otzar-Procs | Where-Object { $_.window -and -not $_.bridge }).Count)
+}
+
+# (24.11) כמה גשרים באותו מחשב: עובדים באוצר החכמה אחד בכל פעם (נעילה משותפת), ומשתפים עותק נסתר אחד
+$script:OZMTX = $null; $script:OZHELD = 0
+$OZ_LAST_FILE = Join-Path $env:TEMP 'ktiv-otzar-last.txt'
+function Oz-Lock([int]$ms) {
+  if (-not $script:OZMTX) { $script:OZMTX = New-Object Threading.Mutex($false, 'Local\KtivBridgeOtzar') }
+  $got = $false
+  try { $got = $script:OZMTX.WaitOne($ms) } catch [Threading.AbandonedMutexException] { $got = $true }
+  if ($got) { $script:OZHELD++ }
+  return $got
+}
+function Oz-Unlock { if ($script:OZHELD -gt 0) { $script:OZHELD--; try { $script:OZMTX.ReleaseMutex() } catch {} } }
+function Oz-Touch { $script:OZ.last = Get-Date; try { [IO.File]::WriteAllText($OZ_LAST_FILE, [string](Get-Date).Ticks) } catch {} }
+function Oz-LastShared {
+  $t = $script:OZ.last
+  try { $x = [datetime][long]([IO.File]::ReadAllText($OZ_LAST_FILE).Trim()); if ($x -gt $t) { $t = $x } } catch {}
+  return $t
+}
+function Oz-Shared {
+  # עותק נסתר חי של גשר אחר במחשב: התהליך הראשי (בלי --type), שהגשר שפתח אותו עדיין רץ
+  return (Otzar-Procs | Where-Object { $_.bridge -and -not $_.orphan -and -not $_.type -and $_.port -and $_.owner -ne $PID } | Select-Object -First 1)
 }
 function Find-Dbs {
   # התקליטור התורני: התיקייה הרגילה, ואחרת הקיצור בשולחן העבודה או בתפריט התחל
@@ -646,7 +678,7 @@ function Oz-Close {
   }
   if ($script:OZ.desk -ne [IntPtr]::Zero) { Start-Sleep -Milliseconds 800; [void][KB]::CloseDesk($script:OZ.desk) }
   if ($tmp) { for ($i = 0; $i -lt 5 -and (Test-Path $tmp); $i++) { try { Remove-Item -LiteralPath $tmp -Recurse -Force } catch { Start-Sleep -Seconds 1 } } }
-  $script:OZ = @{ pid = 0; port = 0; tmp = $null; desk = [IntPtr]::Zero; cdp = $null; target = $null; last = [datetime]::MinValue; books = @() }
+  $script:OZ = @{ pid = 0; port = 0; tmp = $null; desk = [IntPtr]::Zero; cdp = $null; target = $null; last = [datetime]::MinValue; books = @(); owned = $false }
 }
 
 function Oz-Targets {
@@ -661,9 +693,26 @@ function Oz-Main {
 function Oz-Ensure {
   if ($script:OZ.pid -and [KB]::Alive($script:OZ.pid) -and $script:OZ.cdp -and $script:OZ.cdp.Open) { return 'ok' }
   Oz-Close
+  # (24.11) גשר אחר במחשב כבר מחזיק עותק נסתר פתוח – מתחברים אליו (חוסך פתיחה, ושני עותקים לא כותבים לאותה תיקייה)
+  $sh = Oz-Shared
+  if ($sh) {
+    try {
+      $script:OZ.pid = $sh.pid; $script:OZ.port = $sh.port; $script:OZ.owned = $false
+      $t = Oz-Main
+      if ($t) {
+        $script:OZ.target = $t; $script:OZ.cdp = [KB+Cdp]::new($t.webSocketDebuggerUrl)
+        [void]$script:OZ.cdp.Send('Emulation.setFocusEmulationEnabled', '{"enabled":true}', 5000)
+        [void]$script:OZ.cdp.Send('Emulation.setDeviceMetricsOverride', '{"width":1280,"height":1700,"deviceScaleFactor":1.5,"mobile":false}', 5000)
+        Oz-Touch; L ('אוצר החכמה: מתחבר לעותק הנסתר של גשר אחר במחשב (' + $sh.owner + ')'); return 'ok'
+      }
+    } catch { L ('אוצר החכמה: החיבור לעותק של גשר אחר נכשל: ' + $_) }
+    Oz-Close
+  }
   $exe = Find-Otzar
   if (-not $exe) { return 'אוצר החכמה לא מותקן במחשב' }
-  $tmp = Join-Path $env:TEMP ('ktiv-otzar-' + (Get-Random))
+  $t0open = Get-Date
+  $tmp = Join-Path $env:TEMP ('ktiv-otzar-' + $PID + '-' + (Get-Random))
+  $script:OZ.owned = $true
   if (Test-Path 'C:\OtzarApp\otzar') { $null = robocopy 'C:\OtzarApp\otzar' $tmp /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP /XD Cache 'Code Cache' GPUCache DawnCache ShaderCache Crashpad }
   else { New-Item -ItemType Directory -Force -Path $tmp | Out-Null }
   $port = Get-Random -Minimum 9340 -Maximum 9399
@@ -685,11 +734,24 @@ function Oz-Ensure {
   # חלון גבוה, כדי שעמוד שלם ייכנס לצילום
   [void]$script:OZ.cdp.Send('Emulation.setDeviceMetricsOverride', '{"width":1280,"height":1700,"deviceScaleFactor":1.5,"mobile":false}', 5000)
   Start-Sleep -Seconds 3
-  $script:OZ.last = Get-Date
+  Oz-Touch
+  L ('אוצר החכמה: עותק נסתר נפתח תוך ' + [int]((Get-Date) - $t0open).TotalSeconds + ' שנ''')
   return 'ok'
 }
 
+# (23.11) האתר הפסיק לחשוף window._store (עדכון באתר, 23.11 בצהריים) – מוצאים את המאגר דרך האפליקציה עצמה, לפני כל קריאה
+$JS_STORE_SHIM = @'
+(() => { try { if (window._store) return; const isS = o => { try { return !!(o && typeof o === 'object' && o.state && typeof o.commit === 'function' && typeof o.dispatch === 'function'); } catch (x) { return false; } };
+ for (const k of Object.keys(window)) { let o; try { o = window[k]; } catch (x) { continue; } if (isS(o)) { window._store = o; return; } if (o && typeof o === 'object') { try { for (const k2 of Object.keys(o).slice(0, 50)) if (isS(o[k2])) { window._store = o[k2]; return; } } catch (x) {} } }
+ const r = document.querySelector('#app'); const rv = r && r.__vue__;
+ if (rv) { const c = [rv, rv.$root, rv.$root && rv.$root.$children && rv.$root.$children[0]]; for (const v of c) { if (!v) continue; for (const s of [v.$store, v.$options && v.$options.store, v._store]) if (isS(s)) { window._store = s; return; } } }
+ const cand = [document.querySelector('#app'), ...[...document.querySelectorAll('body *')].slice(0, 400)];
+ for (const e of cand) { if (!e) continue; const v = e.__vue__; if (v && v.$store) { window._store = v.$store; return; }
+   const a = e.__vue_app__; if (a) { const s = (a.config && a.config.globalProperties && a.config.globalProperties.$store) || (a._context && a._context.provides && a._context.provides.store); if (s) { window._store = s; return; } } } } catch (x) {} })();
+'@
+
 function Oz-Eval([string]$expr, [int]$timeoutMs = 30000) {
+  $expr = $JS_STORE_SHIM + "`n" + $expr
   $r = $script:OZ.cdp.Send('Runtime.evaluate', ('{"expression":' + [KB]::J($expr) + ',"returnByValue":true,"awaitPromise":true}'), $timeoutMs) | ConvertFrom-Json
   if ($r.result.exceptionDetails) { throw ('JS: ' + $r.result.exceptionDetails.text + ' ' + $r.result.exceptionDetails.exception.description) }
   return $r.result.result.value
@@ -715,7 +777,7 @@ $JS_PAGE = @'
  const cv = [...document.querySelectorAll('canvas.img-canvas')].map(c => { const r = c.getBoundingClientRect(); return {x: r.x, y: r.y, w: r.width, h: r.height}; })
    .filter(r => r.w > 100 && r.y + r.h > 0 && r.y < innerHeight).sort((a, b) => Math.abs(a.y) - Math.abs(b.y))[0] || null;
  const dots = [...document.querySelectorAll('.search-fs-results .dot .text')].map(x => parseInt(x.innerText, 10)).filter(x => !isNaN(x));
- const ins = [...document.querySelectorAll('input[type=text]')].filter(i => { const r = i.getBoundingClientRect(); return r.width > 0 && r.width < 120 && r.y < 160 && !i.placeholder; }).map(i => i.value);
+ const ins = [...document.querySelectorAll('input[type=text]')].filter(i => { const r = i.getBoundingClientRect(); return r.width > 0 && r.width < 120 && r.y < (window._store ? 160 : 320) && !i.placeholder; }).map(i => i.value);
  const t = (document.body.innerText.match(/מתוך\s+([\d,]+)/) || [])[1];
  let book = m ? +m[1] : null, p = m ? +m[2] : null, letter = '';
  // באתר המקוון הכתובת נשארת עם עמוד -1: העמוד והעמוד המודפס נמצאים במצב התוכנה (בדיקה 26)
@@ -723,6 +785,14 @@ $JS_PAGE = @'
    const tb = tabs.find(x => x.book === book) || tabs[tabs.length - 1];
    if (tb) { if (!book) book = tb.book; if (!(p > 0) && tb.page > 0) p = tb.page;
      const pg = (tb.pages || []).find(x => x.position === p); letter = (pg && pg.pagedata && pg.pagedata[0] && pg.pagedata[0].letter) || ''; } } catch (e) {}
+ if (!(p > 0)) { const num = ins.find(v => /^\d+$/.test(String(v).trim())); if (num) p = +num; }
+ if (!(p > 0) || !letter) {   // (23.11) לפי הסימנים שבמסך: "281 מתוך 494" ו"עמוד: רלו"
+   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+   const near = (re) => { const el = [...document.querySelectorAll('body *')].find(e => vis(e) && e.children.length === 0 && re.test((e.innerText || '').trim()));
+     for (let e = el, k = 0; e && k < 4; e = e.parentElement, k++) { const i = [...e.querySelectorAll('input')].filter(vis); if (i.length) return i; } return []; };
+   if (!(p > 0)) { const v = near(/^מתוך\s*[\d,]*$/).map(i => String(i.value).trim()).find(v => /^\d+$/.test(v)); if (v) p = +v; }
+   if (!letter) { const v = near(/^עמוד:?$/).map(i => String(i.value).trim()).find(v => v && !/^\d+$/.test(v)); if (v) letter = v; } }   // (23.11) בלי המאגר: תיבת מספר העמוד ("33 מתוך 476")
+ if (!letter) { const l = ins.find(v => /^[א-ת"'׳״]{1,6}\.?$/.test(String(v).trim())); if (l) letter = l; }
  return JSON.stringify({href: location.href, book: book, p: p, letter: letter, canvas: cv, hits: dots, inputs: ins, total: t ? +t.replace(/,/g, '') : null, vh: innerHeight}); })()
 '@
 
@@ -756,11 +826,82 @@ $JS_SEARCH_HOOK = @'
 $JS_SEARCH_STATE = @'
 (() => { const st = window._store && window._store.state.freeSearch; const area = document.querySelector('.free-search-area');
  const desc = (document.querySelector('.results-description') || {}).innerText || '';
- const lines = area ? area.innerText.split('\n').map(s => s.trim()).filter(Boolean) : [];
- const books = [];
- for (let i = 2; i < lines.length; i++) { const m = /^\[([\d,]+)\]$/.exec(lines[i]); if (m) books.push({title: lines[i - 2], author: lines[i - 1], n: +m[1].replace(/,/g, '')}); }
+ const nb = e => ((e.textContent || '').match(/\[[\d,]+\]/g) || []).length;   // textContent – גם שורות שהאתר לא מצייר כרגע (מחוץ לתצוגה)
+ const rowEls = area ? [...area.querySelectorAll('*')].filter(e => nb(e) === 1 && (!e.parentElement || nb(e.parentElement) > 1)) : [];
+ const books = rowEls.map(e => { const m = /\[([\d,]+)\]/.exec(e.textContent || '');
+   const ls = [...e.querySelectorAll('*')].filter(x => x.children.length === 0).map(x => (x.textContent || '').replace(/\[[\d,]+\]/, '').trim()).filter(Boolean);
+   return {title: ls[0] || '', author: ls[1] || '', n: +m[1].replace(/,/g, '')}; });
  return JSON.stringify({searching: st ? st.searching : null, str: st ? st.searchStr : '', desc: desc.replace(/\s+/g, ' ').trim(), href: location.href, books: books, t: window.__ktT || 0, f: window.__ktF || 0}); })()
 '@
+
+# (23.11) כל רשימת הספרים. לפי צילום מסך של אסתר: אין כפתורי עמודים – חלונית התוצאות (למעלה) נגללת ונטענת בהמשך,
+# ומתחתיה חלונית "רשימה מלאה – כל הספרים" (שבה תגי מספר כמו "2" – לא עמוד). לכן: רק שורות שמעל החלונית התחתונה,
+# וגלילה של חלונית התוצאות לסוף (השורה האחרונה לתצוגה + כל מיכל נגלל שמכיל אותה), עד שלא נוספים ספרים.
+$JS_BOOKS_PAGE = @'
+((mode) => { const area = document.querySelector('.free-search-area'); if (!area) return JSON.stringify({books: [], sig: '', clicked: false});
+ const lines = area.innerText.split('\n').map(s => s.trim()).filter(Boolean);
+ // (23.11) שורה = האלמנט הגדול ביותר שיש בו בדיוק מספר אחד בסוגריים ("[3]") – גם כשהמספר באותה שורה עם המחבר או עם תג (עוז והדר וכד')
+ const nb = e => ((e.textContent || '').match(/\[[\d,]+\]/g) || []).length;   // textContent – גם שורות שהאתר לא מצייר כרגע (מחוץ לתצוגה)
+ const rowEls = [...area.querySelectorAll('*')].filter(e => nb(e) === 1 && (!e.parentElement || nb(e.parentElement) > 1));
+ const books = rowEls.map(e => { const m = /\[([\d,]+)\]/.exec(e.textContent || '');
+   const ls = [...e.querySelectorAll('*')].filter(x => x.children.length === 0).map(x => (x.textContent || '').replace(/\[[\d,]+\]/, '').trim()).filter(Boolean);
+   return {title: ls[0] || '', author: ls[1] || '', n: +m[1].replace(/,/g, '')}; });
+ const all = [...area.querySelectorAll('*')]; const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+ const rows = rowEls;
+ const last = rows[rows.length - 1]; const sc = [];
+ if (last) for (let e = last.parentElement; e && e !== document.body; e = e.parentElement) { if (e.scrollHeight > e.clientHeight + 5 && /(auto|scroll)/.test(getComputedStyle(e).overflowY)) sc.push(e); }
+ let clicked = false;
+ let atEnd = null;
+ if (mode === -1) { for (const e of sc) e.scrollTop = 0; }
+ else if (mode === -2) { const e = sc[0]; if (e) { const b = e.scrollTop; const rh = last ? last.getBoundingClientRect().height || 30 : 30; e.scrollTop = b + Math.max(40, Math.floor(rh * 8)); e.dispatchEvent(new Event('scroll')); atEnd = e.scrollTop <= b + 1; } else atEnd = true; }
+ else if (mode) {
+   if (last) { last.scrollIntoView({block: 'end'}); for (const e of sc) { e.scrollTop = e.scrollHeight; e.dispatchEvent(new Event('scroll')); } }
+   // מספר העמוד הבא – אחרי השורה האחרונה ברשימת התוצאות (באבחון: "... [2] / 2 / <שורת הסיכום>")
+   const c = all.filter(e => vis(e) && (e.innerText || '').trim() === String(mode) && ![...e.children].some(x => (x.innerText || '').trim() === String(mode))
+     && (!last || (last.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING)));
+   const el = c[0]; if (el) { (el.closest('button, a, li, [role=button]') || el).click(); clicked = true; } }
+ const sig = books.length + '|' + (books[0] ? books[0].title : '') + '|' + (books.length ? books[books.length - 1].title : '');
+ return JSON.stringify({books: books, sig: sig, clicked: clicked, atEnd: atEnd, rows: rows.length, sc: sc.length, tail: lines.slice(-6).join(' / ').slice(0, 300)}); })
+'@
+
+$script:OzListDiag = $null
+function Oz-AllBooks($total) {
+  $map = [ordered]@{}; $t0 = Get-Date; $log = @(); $pg = 2; $steps = 0
+  $cur = (Oz-Eval ($JS_BOOKS_PAGE + '(0)')) | ConvertFrom-Json; $first = $cur
+  while (((Get-Date) - $t0).TotalSeconds -lt 110) {
+    $before = $map.Count
+    foreach ($b in @($cur.books)) {   # עמוד שמתחלף או רשימה שמתארכת – אותה שורה יכולה לחזור: המספר הגדול, לא סכום
+      $k = [string]$b.title + '|' + [string]$b.author
+      if ($map.Contains($k)) { if ([int]$b.n -gt [int]$map[$k].n) { $map[$k].n = [int]$b.n } } else { $map[$k] = @{ title = $b.title; author = $b.author; n = [int]$b.n } }
+    }
+    if ($map.Count -ne $before -or -not $steps) { $log += ('+' + ($map.Count - $before)) }
+    if ($total -and $map.Count -ge $total) { break }
+    $moved = $false
+    # (23.11) הרשימה "וירטואלית": האתר מחזיק בדף רק את השורות שליד מקום הגלילה. גוללים בצעדים (כ-8 שורות; ב-30 דולגו ספרים) ואוספים בכל צעד
+    $st = (Oz-Eval ($JS_BOOKS_PAGE + '(-2)')) | ConvertFrom-Json
+    if (-not $st.atEnd) {
+      for ($w = 0; $w -lt 4; $w++) { Start-Sleep -Milliseconds 300; $nx = (Oz-Eval ($JS_BOOKS_PAGE + '(0)')) | ConvertFrom-Json; if ($nx.sig -ne $cur.sig) { break } }
+      $moved = $true; $steps++
+    }
+    if ($moved) { $cur = $nx; continue }
+    $r = (Oz-Eval ($JS_BOOKS_PAGE + '(' + $pg + ')')) | ConvertFrom-Json
+    for ($w = 0; $w -lt 20; $w++) {                    # עד 14 שניות שהרשימה תשתנה (עמוד חדש או המשך שנטען)
+      Start-Sleep -Milliseconds 700
+      $nx = (Oz-Eval ($JS_BOOKS_PAGE + '(0)')) | ConvertFrom-Json
+      if ($nx.sig -ne $cur.sig) { $moved = $true; break }
+    }
+    if (-not $moved) { $log += ('עמוד ' + $pg + ': ' + $(if ($r.clicked) { 'נלחץ ולא השתנה' } else { 'אין' })); break }
+    Start-Sleep -Milliseconds 800
+    $cur = (Oz-Eval ($JS_BOOKS_PAGE + '(0)')) | ConvertFrom-Json
+    if ($r.clicked) { $pg++ }
+  }
+  if ($pg -gt 2) { [void](Oz-Eval ($JS_BOOKS_PAGE + '(1)')); Start-Sleep -Milliseconds 1500 }   # חזרה לעמוד הראשון – Oz-OpenBook מחפש את הספר ברשימה המוצגת
+  [void](Oz-Eval ($JS_BOOKS_PAGE + '(-1)'))
+  $script:OzListDiag = @{ steps = $steps; log = ($log -join ','); rows = $first.rows; sc = $first.sc; tail = $cur.tail }
+  $books = @(); $k = 0
+  foreach ($v in $map.Values) { $books += @{ idx = $k; title = $v.title; author = $v.author; n = $v.n }; $k++ }
+  return $books
+}
 
 function Oz-Search($q, $maxBooks) {
   $before = Oz-Eval 'location.href'
@@ -802,15 +943,49 @@ function Oz-OpenBook($idx) {
   $b = $script:OZ.books | Where-Object { $_.idx -eq [int]$idx } | Select-Object -First 1
   if (-not $b) { throw 'הספר לא נמצא ברשימת התוצאות (חפשו שוב)' }
   $before = Oz-Eval 'location.href'
-  $r = Oz-Eval ('((t) => { const area = document.querySelector(".free-search-area"); if (!area) return "noarea"; const el = [...area.querySelectorAll("*")].find(e => e.children.length === 0 && (e.innerText || "").trim() === t); if (!el) return "notfound"; el.scrollIntoView({block: "center"}); el.click(); return "ok"; })(' + [KB]::J($b.title) + ')')
-  if ($r -ne 'ok') { throw ('פתיחת הספר נכשלה: ' + $r) }
+  $js = '((t, a) => { const area = document.querySelector(".free-search-area"); if (!area) return "noarea"; const leaves = [...area.querySelectorAll("*")].filter(e => e.children.length === 0 && (e.textContent || "").trim() === t); let el = leaves[0]; if (a && leaves.length > 1) { const w = leaves.find(e => { let r = e; for (let k = 0; k < 4 && r; k++, r = r.parentElement) if ((r.textContent || "").includes(a)) return true; return false; }); if (w) el = w; } if (!el) return "notfound"; el.scrollIntoView({block: "center"}); el.click(); return "ok"; })(' + [KB]::J($b.title) + ',' + [KB]::J([string]$b.author) + ')'
+  $r = Oz-Eval $js
+  if ($r -eq 'notfound') {   # (23.11) הרשימה וירטואלית: השורה לא מצוירת – גוללים מההתחלה בצעדים עד שהיא מופיעה
+    [void](Oz-Eval ($JS_BOOKS_PAGE + '(-1)')); Start-Sleep -Milliseconds 600
+    for ($k = 0; $k -lt 80 -and $r -eq 'notfound'; $k++) {
+      $r = Oz-Eval $js; if ($r -ne 'notfound') { break }
+      $st = (Oz-Eval ($JS_BOOKS_PAGE + '(-2)')) | ConvertFrom-Json; Start-Sleep -Milliseconds 450
+      if ($st.atEnd) { $r = Oz-Eval $js; break }
+    }
+  }
+  if ($r -ne 'ok') { throw ('פתיחת הספר נכשלה: ' + $r + ' (' + $b.title + ')') }
   [void](Oz-WaitRender $before 25)
   return (Oz-PageResult $b.title $b.author)
 }
 
 $JS_OCR_TEXT = @'
-(() => { const a = document.querySelector('.ocr-text-area'); const st = window._store.state.bookPopups;
+(() => { const a = document.querySelector('.ocr-text-area'); const st = (window._store && window._store.state.bookPopups) || {};
  return JSON.stringify({visible: st.OCRResultsVisible, text: a ? ((a.value !== undefined && a.value) || a.innerText || '') : ''}); })()
+'@
+$JS_OCR_ON = @'
+(() => { if (window._store) { try { window._store.dispatch('bookPopups/setOCREnable', true); return 'store'; } catch (e) {} }
+ // (23.11) בלי המאגר הפנימי: הכלי "זיהוי טקסט" בסרגל, כמו שמנויה לוחצת עליו
+ const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+ const lab = e => [e.title, e.getAttribute('aria-label'), e.getAttribute('data-tooltip'), e.getAttribute('tooltip'), (e.innerText || '').trim()].filter(Boolean).join(' ');
+ const c = [...document.querySelectorAll('[title], [aria-label], [data-tooltip], button, .toolbar *')].filter(vis);
+ const b = c.find(e => /OCR|זיהוי\s*תווים|זיהוי\s*טקסט|העתק(ת)?\s*טקסט|בחירת\s*טקסט|סימון\s*טקסט/i.test(lab(e)));
+ if (b) { (b.closest('button, a, [role=button]') || b).click(); return 'btn:' + lab(b).slice(0, 40); }
+ const ic = [...document.querySelectorAll('.font-icon-bar')]; const o = ic.find(e => /ocr/i.test(String(e.className)));
+ if (o) { (o.closest('.item') || o).click(); return 'icon:' + String(o.className).slice(-30); }
+ const sa = ic.find(e => /icon-selectArea/.test(String(e.className)));   // (23.11) בחירת אזור – אחריה האתר מציע מה לעשות באזור (בהם זיהוי טקסט)
+ if (sa) { if (!/active/.test(String(sa.className))) (sa.closest('.item') || sa).click(); return 'selectArea'; }
+ const icons = ic.map(e => String(e.className).replace('font-icon-bar font-icon center-it ', '') + '@' + ((e.closest('.item') || e).getAttribute('title') || ''));
+ const bar = [...document.querySelectorAll('body *')].filter(e => { if (!vis(e)) return false; const r = e.getBoundingClientRect(); return r.x < 70 && r.width < 50 && r.height < 50 && r.width > 14 && !e.closest('svg, img') ; })
+   .map(e => { const r = e.getBoundingClientRect(); const im = e.querySelector('img, use'); return Math.round(r.y) + ':' + e.tagName + '.' + String(e.className && e.className.baseVal !== undefined ? e.className.baseVal : e.className).slice(0, 40) + (im ? '[' + (im.getAttribute('src') || im.getAttribute('href') || im.getAttribute('xlink:href') || '').slice(-40) + ']' : ''); });
+ return 'none: ' + icons.join(' ; ') + ' || more: ' + [...document.querySelectorAll('.toolbox-more-btn, .toolbox-more-btn *')].map(e => String(e.className)).slice(0, 5).join(' ; '); })()
+'@
+$JS_OCR_MENU = @'
+(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+ const els = [...document.querySelectorAll('button, a, li, [role=button], [role=menuitem], div, span')].filter(e => vis(e) && e.children.length <= 2);
+ const t = e => (e.innerText || e.title || '').trim();
+ const b = els.find(e => /^(OCR|זיהוי\s*(תווים|טקסט)|הצג\s*טקסט|טקסט|העתק\s*טקסט|העתקת\s*טקסט)$/i.test(t(e)));
+ if (b) { b.click(); return 'clicked:' + t(b); }
+ return 'menu:' + [...new Set(els.map(t).filter(x => x && x.length < 25))].slice(-40).join(' | '); })()
 '@
 $JS_OCR_CLOSE = @'
 (() => { const a = document.querySelector('.ocr-text-area'); let n = 0;
@@ -836,7 +1011,7 @@ function Oz-Region($params) {
   }
   if ($want -eq 'text' -or $want -eq 'both') {
     $old = ((Oz-Eval $JS_OCR_TEXT) | ConvertFrom-Json).text
-    [void](Oz-Eval "(() => { window._store.dispatch('bookPopups/setOCREnable', true); return 1; })()")
+    $script:OzOcrHow = Oz-Eval $JS_OCR_ON
     Start-Sleep -Milliseconds 600
     $ax = [int]$x2 - 3; $ay = [int]$y1 + 3; $bx = [int]$x1 + 3; $by = [int]$y2 - 3
     [void](Oz-Send 'Input.dispatchMouseEvent' ('{"type":"mouseMoved","x":' + $ax + ',"y":' + $ay + '}'))
@@ -846,9 +1021,10 @@ function Oz-Region($params) {
       [void](Oz-Send 'Input.dispatchMouseEvent' ('{"type":"mouseMoved","x":' + $xx + ',"y":' + $yy + ',"button":"left","buttons":1}'))
     }
     [void](Oz-Send 'Input.dispatchMouseEvent' ('{"type":"mouseReleased","x":' + $bx + ',"y":' + $by + ',"button":"left","buttons":0,"clickCount":1}'))
-    $txt = ''
-    for ($i = 0; $i -lt 30; $i++) {
+    $txt = ''; $script:OzOcrMenu = ''
+    for ($i = 0; $i -lt 18; $i++) {
       Start-Sleep -Milliseconds 700
+      if ($script:OzOcrHow -eq 'selectArea' -and $i -in 1, 4) { $script:OzOcrMenu = Oz-Eval $JS_OCR_MENU }
       $o = (Oz-Eval $JS_OCR_TEXT) | ConvertFrom-Json
       if ($o.text -and $o.text.Trim() -and $o.text -ne $old) { Start-Sleep -Milliseconds 800; $txt = ((Oz-Eval $JS_OCR_TEXT) | ConvertFrom-Json).text; break }
     }
@@ -861,12 +1037,22 @@ function Oz-Region($params) {
 
 $script:CLOSED_EDITOR = $false
 function Otzar-Auto($vars, $params, [int]$start = 0) {
+  # (24.11) אוצר החכמה – גשר אחד בכל פעם במחשב
+  if (-not (Oz-Lock 120000)) { return @{ state = 'busy'; message = 'אוצר החכמה עסוק בחיפוש של גשר אחר במחשב הזה (למשל חלון אחר של קלוד) – נסו שוב בעוד דקה' } }
+  $t0 = Get-Date
+  try { $r = Otzar-Auto-Inner $vars $params $start }
+  finally { Oz-Touch; Oz-Unlock }
+  L ('אוצר החכמה: ' + [int]((Get-Date) - $t0).TotalSeconds + ' שנ'' (' + $r.state + $(if ($r.used) { ', ניסוח ' + ($r.vi + 1) } else { '' }) + $(if ($null -ne $r.count) { ', ' + $r.count + ' תוצאות' } else { '' }) + $(if (@($r.pages).Count) { ', ' + @($r.pages).Count + ' עמודים' } else { '' }) + ')')
+  return $r
+}
+
+function Otzar-Auto-Inner($vars, $params, [int]$start = 0) {
   # vars: ניסוחים מהמדויק (תחביר אוצר החכמה) לפשוט. מתחילים מ-start ועוברים לבא כשאין תוצאות (הרחבת החיפוש לפי ההדרכה)
   # עותק נסתר שלנו שנשאר מהפעלה קודמת: סוגרים
   foreach ($x in @(Otzar-Procs | Where-Object { $_.orphan })) { L ('אוצר החכמה: סוגר עותק נסתר שנשאר, ' + $x.pid); Stop-Process -Id $x.pid -Force -ErrorAction SilentlyContinue }
   # אוצר החכמה שנשאר פתוח ברקע בלי חלון (בדיקה 19: תהליך אחד כזה סגר את העותק שלנו – רק עותק אחד יכול לרוץ).
   # העורך לא עובד בו (אין חלון), ולכן סוגרים אותו תמיד, בלי קשר להגדרה (החלטת אסתר, 09.11.2026)
-  $bg = @(Otzar-Procs | Where-Object { -not $_.window -and -not $_.orphan -and -not $_.type })
+  $bg = @(Otzar-Procs | Where-Object { -not $_.window -and -not $_.orphan -and -not $_.type -and -not $_.bridge })
   if ($bg.Count -and -not (Editor-OtzarRunning)) {
     L ('אוצר החכמה פתוח ברקע בלי חלון: סוגרים אותו (' + (($bg | ForEach-Object { $_.pid }) -join ',') + ')')
     foreach ($x in $bg) { Stop-Process -Id $x.pid -Force -ErrorAction SilentlyContinue }
@@ -907,6 +1093,20 @@ function Otzar-Auto($vars, $params, [int]$start = 0) {
   return $out
 }
 
+# (23.11) האתר מחזיר בבחירת אזור עד כ-1,050 תווים – קוראים את העמוד בארבע רצועות ומחברים
+function Oz-PageText {
+  $parts = @(); $errs = @()
+  foreach ($y in 0, 0.25, 0.5, 0.75) {
+    $reg = Oz-Region @{ x = 0; y = $y; w = 1; h = 0.25; want = 'text' }
+    if (-not $reg.text) { Start-Sleep -Milliseconds 1200; $reg = Oz-Region @{ x = 0; y = $y; w = 1; h = 0.25; want = 'text' } }
+    if ($reg.text) { $parts += $reg.text } elseif ($reg.text_error) { $errs += $reg.text_error }
+    if (-not $parts.Count -and $y -eq 0.25) { break }   # (23.11) שתי רצועות ראשונות ריקות – הזיהוי לא עובד בעמוד הזה; לא לתקוע את הגשר לכל השיחות
+  }
+  $res = @{ text = (($parts -join ' ') -replace '\s+', ' ').Trim() }
+  if (-not $res.text -and $errs.Count) { $res.text_error = $errs[0] }
+  return $res
+}
+
 function Oz-Pages($idxs, [string]$mode) {
   # העמוד שבו נמצא החיפוש, בכל ספר מרשימת התוצאות של החיפוש האחרון (טקסט מזיהוי התווים של אוצר החכמה, או צילום)
   $pages = @()
@@ -918,10 +1118,12 @@ function Oz-Pages($idxs, [string]$mode) {
       $one = @{ idx = [int]$i; book_id = $pg.book_id; title = $b.title; author = $b.author; page = $pg.p; page_label = $label }
       if ($mode -eq 'image') { $one.image = $pg.image }
       else {
-        $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' }
-        # בדיקה 26: הקריאה הראשונה אחרי פתיחת הדפדפן חזרה ריקה – מנסים שוב פעם אחת
-        if (-not $reg.text) { Start-Sleep -Milliseconds 1500; $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' } }
+        # (23.11) התאמה לרוחב (בהתאמה לגובה הזיהוי חזר ריק); העמוד כולו נכנס בזכות חלון גבוה (Ozo-Ensure, 3400) – אחרת חזרו כ-1,000 תווים
+        $fit = Oz-Eval '(() => { const e = document.querySelector(".font-icon-bar.icon-fitWidth"); if (!e) return "none"; if (/active/.test(String(e.className))) return "already"; (e.closest(".item") || e).click(); return "clicked"; })()'
+        if ($fit -eq 'clicked') { Start-Sleep -Milliseconds 1800 }
+        $reg = Oz-PageText   # בדיקה 26: הקריאה הראשונה חזרה ריקה – Oz-PageText מנסה שוב כל רצועה
         $one.text = $reg.text; if ($reg.text_error) { $one.text_error = $reg.text_error }
+        if (-not $reg.text) { $one.text_error = ([string]$one.text_error + ' ocr=' + [string]$script:OzOcrHow + ' menu=' + [string]$script:OzOcrMenu).Trim() }   # (23.11) אבחון
       }
       $pages += $one
     } catch { L ('אוצר החכמה, ספר ' + $i + ': ' + $_); $pages += @{ idx = [int]$i; error = [string]$_ } }
@@ -934,12 +1136,16 @@ function Otzar-Books($p) {
   $q = [string]$p.query
   if (-not $q) { throw 'חסר הניסוח' }
   if (Editor-OtzarRunning) { return @{ state = 'busy'; message = 'אוצר החכמה היה פתוח במחשב, ולכן לא חיפשנו בו.' } }
-  $e = Oz-Ensure
-  if ($e -ne 'ok') { return @{ state = 'error'; message = $e } }
-  if ($script:OZ.lastq -ne $q -or -not $script:OZ.books.Count) { [void](Oz-Search $q 40) }
-  $idxs = @($p.books | ForEach-Object { [int]$_ } | Select-Object -First 8)
-  $out = @{ state = 'ok'; used = $q; pages = @(Oz-Pages $idxs ([string]$p.otzar_result)) }
-  $script:OZ.last = Get-Date
+  if (-not (Oz-Lock 120000)) { return @{ state = 'busy'; message = 'אוצר החכמה עסוק בחיפוש של גשר אחר במחשב הזה – נסו שוב בעוד דקה' } }
+  $t0 = Get-Date
+  try {
+    $e = Oz-Ensure
+    if ($e -ne 'ok') { return @{ state = 'error'; message = $e } }
+    if ($script:OZ.lastq -ne $q -or -not $script:OZ.books.Count) { [void](Oz-Search $q 40) }   # עותק משותף: הרשימה אולי של חיפוש אחר
+    $idxs = @($p.books | ForEach-Object { [int]$_ } | Select-Object -First 8)
+    $out = @{ state = 'ok'; used = $q; pages = @(Oz-Pages $idxs ([string]$p.otzar_result)) }
+  } finally { Oz-Touch; Oz-Unlock }
+  L ('אוצר החכמה, עמודים מספרים: ' + [int]((Get-Date) - $t0).TotalSeconds + ' שנ'' (' + @($out.pages).Count + ' עמודים)')
   return $out
 }
 
@@ -1001,13 +1207,15 @@ function Run-Batch($job) {
     $n++
     $key = Q-Key $q
     try { [void](Api 'POST' ('/bridge-api/progress/' + $job.id) @{ text = ('ניסוח ' + $n + ' מתוך ' + $qs.Count + ': ' + $key) } 20) } catch {}
-    $one = @{}
+    $one = @{}; $tq = @()
+    $tp = Get-Date
     if ($p.programs.responsa) {
       if ($rskip) { $one.responsa = $rskip }
       else {
         try { $one.responsa = Responsa-Vars (Q-Vars $q 'responsa') (List-Max $p 'responsa') } catch { $one.responsa = @{ state = 'error'; message = [string]$_ } }
         if ($one.responsa.state -ne 'ok') { $rskip = $one.responsa; if (-not $note) { $note = $one.responsa.message } }
       }
+      $tq += ('בר אילן ' + [int]((Get-Date) - $tp).TotalSeconds); $tp = Get-Date
     }
     if ($p.programs.dbs) {
       if ($dskip) { $one.dbs = $dskip }
@@ -1015,6 +1223,7 @@ function Run-Batch($job) {
         try { $one.dbs = Dbs-Vars (Q-Vars $q 'dbs') (List-Max $p 'dbs') } catch { $one.dbs = @{ state = 'error'; message = [string]$_ } }
         if ($one.dbs.state -ne 'ok') { $dskip = $one.dbs; if (-not $note) { $note = $one.dbs.message } }
       }
+      $tq += ('התקליטור ' + [int]((Get-Date) - $tp).TotalSeconds); $tp = Get-Date
     }
     if ($p.programs.otzar) {
       if ($skip) { $one.otzar = $skip }
@@ -1022,7 +1231,9 @@ function Run-Batch($job) {
         try { $one.otzar = Otzar-Auto (Q-Vars $q 'otzar') $p $ozStart } catch { $one.otzar = @{ state = 'error'; message = [string]$_ } }
         if ($one.otzar.state -eq 'busy' -or $one.otzar.state -eq 'unavailable') { $skip = $one.otzar; $note = $one.otzar.message }
       }
+      $tq += ('אוצר החכמה ' + [int]((Get-Date) - $tp).TotalSeconds)
     }
+    L ('  ניסוח ' + $n + ' מתוך ' + $qs.Count + ' (שניות): ' + ($tq -join ', '))
     $results[$key] = $one
   }
   return @{ results = $results; note = $note; control = $control }
@@ -1088,25 +1299,35 @@ function Ozo-Ensure {
   $script:OZO.target = $t
   $script:OZO.cdp = [KB+Cdp]::new($t.webSocketDebuggerUrl)
   [void]$script:OZO.cdp.Send('Emulation.setFocusEmulationEnabled', '{"enabled":true}', 5000)
-  [void]$script:OZO.cdp.Send('Emulation.setDeviceMetricsOverride', '{"width":1280,"height":1700,"deviceScaleFactor":1.5,"mobile":false}', 5000)
+  [void]$script:OZO.cdp.Send('Emulation.setDeviceMetricsOverride', '{"width":1280,"height":3400,"deviceScaleFactor":1.5,"mobile":false}', 5000)
   for ($i = 0; $i -lt 40; $i++) {
     Start-Sleep -Milliseconds 500
-    $ok = $null; try { $ok = Ozo-Eval '!!window._store && !!document.querySelector("input[id^=fs_input]")' } catch {}
+    $ok = $null; try { $ok = Ozo-Eval '!!document.querySelector("input[id^=fs_input]")' } catch {}
     if ($ok) { break }
+  }
+  if (-not $ok) {   # (23.11) כרום שחזר את הלשונית האחרונה מחלון הכניסה (עמוד ספר) – שם אין window._store והגשר חשב שזה אורח. חוזרים לדף הבית
+    try { [void]$script:OZO.cdp.Send('Page.navigate', ('{"url":' + [KB]::J($OZO_URL) + '}'), 10000) } catch {}
+    for ($i = 0; $i -lt 40; $i++) {
+      Start-Sleep -Milliseconds 500
+      $ok = $null; try { $ok = Ozo-Eval '!!document.querySelector("input[id^=fs_input]")' } catch {}
+      if ($ok) { break }
+    }
+    if (-not $ok) { L 'אוצר החכמה המקוון: הדף לא נטען כראוי גם אחרי מעבר לדף הבית' }
   }
   $script:OZO.last = Get-Date
   return 'ok'
 }
 
 function Ozo-Eval([string]$expr) {
+  $expr = $JS_STORE_SHIM + "`n" + $expr
   $r = $script:OZO.cdp.Send('Runtime.evaluate', ('{"expression":' + [KB]::J($expr) + ',"returnByValue":true,"awaitPromise":true}'), 30000) | ConvertFrom-Json
   return $r.result.result.value
 }
 
 function Ozo-Login {
-  # אורח: פותחים חלון גלוי של אותו פרופיל באתר, ואסתר נכנסת למנוי בעצמה. פעם בשעה לכל היותר.
+  # אורח: פותחים חלון גלוי של אותו פרופיל באתר, ואסתר נכנסת למנוי בעצמה. לכל היותר פעם ב-3 דקות.
   Ozo-Close
-  if (((Get-Date) - [datetime]$script:OZO.login).TotalMinutes -lt 60 -and $script:OZO.login) { return }
+  if (((Get-Date) - [datetime]$script:OZO.login).TotalMinutes -lt 3 -and $script:OZO.login) { return }   # (23.11) היה פעם בשעה – אסתר סגרה חלון וחיכתה שעה לחדש
   $exe = Find-Chrome
   if (-not $exe) { return }
   Start-Process -FilePath $exe -ArgumentList @('--user-data-dir="' + $OZO_PROFILE + '"', '--no-first-run', '--no-default-browser-check', '--new-window', $OZO_URL) | Out-Null
@@ -1145,10 +1366,16 @@ function Otzar-Online($p) {
   $e = Ozo-Ensure
   if ($e -eq 'login-open') { return @{ state = 'login'; message = 'חלון הכניסה לאוצר החכמה המקוון פתוח במחשב: היכנסו למנוי וסגרו אותו' } }
   if ($e -ne 'ok') { return @{ state = 'error'; message = $e } }
-  $guest = Ozo-Eval '(() => { const u = window._store && window._store.state.user; return !u || !u.fullname || /אורח/.test(u.fullname); })()'
+  # (23.11) דפדפן שנפתח הרגע (אחרי עדכון הגשר) עוד לא טען את פרטי המנוי – מחכים עד 12 שניות לפני שמחליטים שזה אורח
+  for ($gi = 0; $gi -lt 24; $gi++) {
+    $guest = Ozo-Eval '(() => { const s = window._store; if (!s) { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }; return [...document.querySelectorAll("button, a, [role=button]")].some(e => vis(e) && /^(כניסה|התחבר|התחברות|כניסה למנויים)$/.test((e.innerText || "").trim())); } const u = s.state.user; return !u || !u.fullname || /אורח/.test(u.fullname); })()'
+    if (-not $guest) { break }; Start-Sleep -Milliseconds 500
+  }
   if ($guest) {
+    $gd = ''; try { $gd = Ozo-Eval '(() => { const s = window._store; const u = s && s.state.user; return JSON.stringify({store: !!s, href: location.href.slice(0, 80), title: document.title, ready: document.readyState, body: (document.body ? document.body.innerText : "").replace(/\s+/g, " ").slice(0, 200), keys: u ? Object.keys(u).slice(0, 30) : null, fullname: u ? u.fullname : null, cookies: document.cookie.length, rootkeys: (() => { const v = document.querySelector("#app").__vue__; return v ? Object.keys(v).filter(k => k[0] === "$" || k[0] === "_").slice(0, 40) : null; })(), win: (() => { const f = document.createElement("iframe"); document.body.appendChild(f); const base = new Set(Object.keys(f.contentWindow)); f.remove(); return Object.keys(window).filter(k => !base.has(k)).slice(0, 40); })(), elprops: [...document.querySelectorAll("body > *")].slice(0, 6).map(e => e.tagName + "#" + e.id + ":" + Object.keys(e).filter(k => k.startsWith("_")).join("/"))}); })()' } catch { $gd = 'eval-error: ' + $_ }
+    L ('אוצר החכמה המקוון: נראה כאורח ' + $gd)
     Ozo-Login
-    return @{ state = 'login'; message = 'צריך להיכנס פעם אחת לאוצר החכמה המקוון בחלון שנפתח במחשב' }
+    return @{ state = 'login'; message = 'צריך להיכנס פעם אחת לאוצר החכמה המקוון בחלון שנפתח במחשב'; diag = $gd }
   }
   # אותו קוד של אוצר החכמה שבמחשב, על הדפדפן של האתר
   $saved = $script:OZ; $script:OZ = $script:OZO
@@ -1165,6 +1392,7 @@ function Otzar-Online($p) {
       [void](Ozo-Eval ($JS_SCOPE + '(' + [KB]::J('בכל הספרים') + ')')); [void](Ozo-ListFilter ''); $scoped = $false
       $r = Oz-Search $q 40; $r.in_book = $false
     } elseif ($scoped) { $r.in_book = $true }
+    if ($p.all) { $r.books = @(Oz-AllBooks $r.books_total); $r.list_diag = $script:OzListDiag }   # (23.11) רשימה מלאה – רק כשלא פותחים ספרים (books=0)
     $n = [Math]::Max(0, [Math]::Min([int]$p.books, 5))
     # 16.11: הספר שצוין (prefer) – קודם הוא מתוך 40 התוצאות, ורק אחר כך הראשונים ברשימה
     $idx = @(); $pref = ([string]$p.prefer) -replace '["''\u05F3\u05F4\s]', ''
@@ -1174,9 +1402,15 @@ function Otzar-Online($p) {
         if ($tk.Contains($pref) -and $idx.Count -lt $n) { $idx += [int]$b.idx }
       }
     }
-    for ($i = 0; $i -lt @($r.books).Count -and $idx.Count -lt $n; $i++) { if ($idx -notcontains $i) { $idx += $i } }
+    if ($pref.Length -ge 3 -and -not $idx.Count -and $n -gt 0) {   # (23.11) הספר שצוין לא בין 40 הראשונים – מחפשים אותו בכל הרשימה (גלילה)
+      $all = @(Oz-AllBooks $r.books_total); $script:OZ.books = $all
+      foreach ($b in $all) { $tk = ([string]$b.title) -replace '["''\u05F3\u05F4\s]', ''; if ($tk.Contains($pref) -and $idx.Count -lt $n) { $idx += [int]$b.idx } }
+      if (-not $idx.Count) { $script:OZ.books = @($r.books) } else { $r.prefer_found = 'ברשימה המלאה' }
+    }
+    if ($pref.Length -ge 3 -and -not $idx.Count) { $r.prefer_found = 'לא נמצא ברשימה' }
+    for ($i = 0; $i -lt @($script:OZ.books).Count -and $idx.Count -lt $n; $i++) { if ($idx -notcontains $i) { $idx += $i } }
     $pages = @(); if ($idx.Count) { $pages = @(Oz-Pages $idx 'text') }
-    $out = @{ state = 'ok'; count = $r.count; books_total = $r.books_total; books = @($r.books); pages = $pages; in_book = [bool]$r.in_book }
+    $out = @{ state = 'ok'; count = $r.count; books_total = $r.books_total; books = @($r.books); pages = $pages; in_book = [bool]$r.in_book; list_diag = $r.list_diag; prefer_found = $r.prefer_found }
   } finally {
     if ($scoped) { try { [void](Ozo-Eval ($JS_SCOPE + '(' + [KB]::J('בכל הספרים') + ')')); [void](Ozo-ListFilter '') } catch {} }
     $script:OZO = $script:OZ; $script:OZ = $saved
@@ -1220,7 +1454,10 @@ function Otzar-Online-Pages($p) {
   $e = Ozo-Ensure
   if ($e -eq 'login-open') { return @{ state = 'login'; message = 'חלון הכניסה לאוצר החכמה המקוון פתוח במחשב: היכנסו למנוי וסגרו אותו' } }
   if ($e -ne 'ok') { return @{ state = 'error'; message = $e } }
-  $guest = Ozo-Eval '(() => { const u = window._store && window._store.state.user; return !u || !u.fullname || /אורח/.test(u.fullname); })()'
+  for ($gi = 0; $gi -lt 24; $gi++) {   # כמו בחיפוש: לחכות לפרטי המנוי בדפדפן שנפתח הרגע
+    $guest = Ozo-Eval '(() => { const s = window._store; if (!s) { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }; return [...document.querySelectorAll("button, a, [role=button]")].some(e => vis(e) && /^(כניסה|התחבר|התחברות|כניסה למנויים)$/.test((e.innerText || "").trim())); } const u = s.state.user; return !u || !u.fullname || /אורח/.test(u.fullname); })()'
+    if (-not $guest) { break }; Start-Sleep -Milliseconds 500
+  }
   if ($guest) { Ozo-Login; return @{ state = 'login'; message = 'צריך להיכנס פעם אחת לאוצר החכמה המקוון בחלון שנפתח במחשב' } }
   $saved = $script:OZ; $script:OZ = $script:OZO
   $pages = @(); $title = ''
@@ -1240,8 +1477,9 @@ function Otzar-Online-Pages($p) {
         $st = Oz-PageState
         if ([int]$st.p -ne $pp -or -not $st.canvas) { $st = Ozo-GoPos $pp }
         if ([int]$st.p -ne $pp) { throw ('לא עבר לעמוד ' + $pp + ' (נשאר ב-' + $st.p + ')') }
-        $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' }
-        if (-not $reg.text) { Start-Sleep -Milliseconds 1500; $reg = Oz-Region @{ x = 0; y = 0; w = 1; h = 1; want = 'text' } }
+        $fit = Oz-Eval '(() => { const e = document.querySelector(".font-icon-bar.icon-fitWidth"); if (!e) return "none"; if (/active/.test(String(e.className))) return "already"; (e.closest(".item") || e).click(); return "clicked"; })()'
+        if ($fit -eq 'clicked') { Start-Sleep -Milliseconds 1800 }   # (23.11) התאמה לרוחב, בחלון הגבוה כל העמוד בתצוגה
+        $reg = Oz-PageText
         $label = [string]$st.letter; if (-not $label -and @($st.inputs).Count) { $label = @($st.inputs)[0] }
         $one = @{ page = $pp; page_label = $label; text = $reg.text }; if ($reg.text_error) { $one.text_error = $reg.text_error }
         $pages += $one
@@ -1267,9 +1505,14 @@ function Run-Job($job) {
 function Housekeeping {
   # אוצר החכמה של העורך נפתח בזמן שהעותק שלנו פתוח: סוגרים את שלנו מיד, כדי שהוא לא ייחסם
   if ($script:OZ.pid) {
-    if (Editor-OtzarRunning) { L 'אוצר החכמה נפתח אצל העורך: סוגר את העותק הנסתר'; Oz-Close }
-    elseif (((Get-Date) - $script:OZ.last).TotalSeconds -gt 300) { L 'אוצר החכמה: סגירה אחרי 5 דקות בלי שימוש'; Oz-Close }
-    elseif (-not [KB]::Alive($script:OZ.pid)) { Oz-Close }
+    if (-not [KB]::Alive($script:OZ.pid)) { Oz-Close }
+    elseif (-not $script:OZ.owned) { if (((Get-Date) - $script:OZ.last).TotalSeconds -gt 300) { Oz-Close } }   # עותק של גשר אחר – רק מתנתקים
+    elseif (Oz-Lock 0) {   # (24.11) לא סוגרים באמצע חיפוש של גשר אחר שמחובר לעותק שלנו
+      try {
+        if (Editor-OtzarRunning) { L 'אוצר החכמה נפתח אצל העורך: סוגר את העותק הנסתר'; Oz-Close }
+        elseif (((Get-Date) - (Oz-LastShared)).TotalSeconds -gt 300) { L 'אוצר החכמה: סגירה אחרי 5 דקות בלי שימוש'; Oz-Close }
+      } finally { Oz-Unlock }
+    }
   }
   if ([KB]::RPid -and ((Get-Date) - $script:RS.last).TotalSeconds -gt 300) { L 'בר אילן: סגירה אחרי 5 דקות בלי שימוש'; [KB]::ResponsaClose() }
   if ([KB]::DPid -and ((Get-Date) - $script:DS.last).TotalSeconds -gt 300) { L 'התקליטור התורני: סגירה אחרי 5 דקות בלי שימוש'; [KB]::DbsClose() }
@@ -1332,14 +1575,16 @@ if ($Local) {
     $job = $null
     try { $job = $line | ConvertFrom-Json } catch { Out-Local @{ error = 'שורה לא תקינה' }; continue }
     try {
+      $tj = Get-Date
       $res = Run-Job $job
       Out-Local @{ id = $job.id; result = $res }
+      L ('משימה ' + $job.kind + ' – ' + [int]((Get-Date) - $tj).TotalSeconds + ' שנ''')   # (24.11) זמנים גם ביומן התוסף
     } catch {
       L ('שגיאה: ' + $_ + ' @ ' + $_.InvocationInfo.ScriptLineNumber)
       Out-Local @{ id = $job.id; error = [string]$_ }
     }
   }
-  try { Oz-Close } catch {}; try { Ozo-Close } catch {}; try { [KB]::ResponsaClose() } catch {}; try { [KB]::DbsClose() } catch {}
+  try { if ($script:OZ.owned) { [void](Oz-Lock 60000) }; Oz-Close; Oz-Unlock } catch {}; try { Ozo-Close } catch {}; try { [KB]::ResponsaClose() } catch {}; try { [KB]::DbsClose() } catch {}
   L 'התוסף נסגר'
   exit
 }
