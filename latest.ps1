@@ -6,7 +6,7 @@
 # -Local: מצב התוסף לאפליקציית קלוד (ktiv/bridge/desktop). בלי שרת: משימות מגיעות בשורות JSON בקלט,
 #         ותשובות יוצאות בשורות שמתחילות ב-@@KB@@. תמונות נשמרות בתיקייה ImgDir. יומן: %LOCALAPPDATA%\OtzarBarilanClaude
 param([switch]$Install, [switch]$Run, [switch]$Uninstall, [string]$Server = '', [string]$Key = '', [switch]$Local, [string]$ImgDir = '')
-$VERSION = '2026.11.24.1'
+$VERSION = '2026.11.26.1'
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $HOME_DIR = Join-Path $env:LOCALAPPDATA $(if ($Local) { 'OtzarBarilanClaude' } else { 'KtivBridge' })
@@ -827,8 +827,10 @@ $JS_SEARCH_STATE = @'
 (() => { const st = window._store && window._store.state.freeSearch; const area = document.querySelector('.free-search-area');
  const desc = (document.querySelector('.results-description') || {}).innerText || '';
  const nb = e => ((e.textContent || '').match(/\[[\d,]+\]/g) || []).length;   // textContent – גם שורות שהאתר לא מצייר כרגע (מחוץ לתצוגה)
- const rowEls = area ? [...area.querySelectorAll('*')].filter(e => nb(e) === 1 && (!e.parentElement || nb(e.parentElement) > 1)) : [];
- const books = rowEls.map(e => { const m = /\[([\d,]+)\]/.exec(e.textContent || '');
+ const items = area ? [...area.querySelectorAll('.item-book')] : [];   // (24.11) מבנה חדש: שורה = .item-book, המספר בתג .fs-hit-badge (בלי סוגריים)
+ const rowEls = items.length ? items : area ? [...area.querySelectorAll('*')].filter(e => nb(e) === 1 && (!e.parentElement || nb(e.parentElement) > 1)) : [];
+ const books = items.length ? ((items) => items.map(e => { const t = q => ((e.querySelector(q) || {}).textContent || '').trim(); const m = /freebook_(\d+)/.exec(e.id || '');
+   return {title: t('.name-book'), author: t('.name-author'), n: +(t('.fs-hit-badge .num').replace(/,/g, '') || 1), i: m ? +m[1] : null, book_id: +(e.getAttribute('book') || 0) || null}; }).sort((a, b) => (a.i ?? 0) - (b.i ?? 0)))(items) : rowEls.map(e => { const m = /\[([\d,]+)\]/.exec(e.textContent || '');
    const ls = [...e.querySelectorAll('*')].filter(x => x.children.length === 0).map(x => (x.textContent || '').replace(/\[[\d,]+\]/, '').trim()).filter(Boolean);
    return {title: ls[0] || '', author: ls[1] || '', n: +m[1].replace(/,/g, '')}; });
  return JSON.stringify({searching: st ? st.searching : null, str: st ? st.searchStr : '', desc: desc.replace(/\s+/g, ' ').trim(), href: location.href, books: books, t: window.__ktT || 0, f: window.__ktF || 0}); })()
@@ -842,8 +844,11 @@ $JS_BOOKS_PAGE = @'
  const lines = area.innerText.split('\n').map(s => s.trim()).filter(Boolean);
  // (23.11) שורה = האלמנט הגדול ביותר שיש בו בדיוק מספר אחד בסוגריים ("[3]") – גם כשהמספר באותה שורה עם המחבר או עם תג (עוז והדר וכד')
  const nb = e => ((e.textContent || '').match(/\[[\d,]+\]/g) || []).length;   // textContent – גם שורות שהאתר לא מצייר כרגע (מחוץ לתצוגה)
- const rowEls = [...area.querySelectorAll('*')].filter(e => nb(e) === 1 && (!e.parentElement || nb(e.parentElement) > 1));
- const books = rowEls.map(e => { const m = /\[([\d,]+)\]/.exec(e.textContent || '');
+ const items = [...area.querySelectorAll('.item-book')];   // (24.11) מבנה חדש – ראו JS_SEARCH_STATE
+ const rowEls = items.length ? items.slice().sort((a, b) => (+((/freebook_(\d+)/.exec(a.id) || [])[1] || 0)) - (+((/freebook_(\d+)/.exec(b.id) || [])[1] || 0)))
+   : [...area.querySelectorAll('*')].filter(e => nb(e) === 1 && (!e.parentElement || nb(e.parentElement) > 1));
+ const books = items.length ? ((items) => items.map(e => { const t = q => ((e.querySelector(q) || {}).textContent || '').trim(); const m = /freebook_(\d+)/.exec(e.id || '');
+   return {title: t('.name-book'), author: t('.name-author'), n: +(t('.fs-hit-badge .num').replace(/,/g, '') || 1), i: m ? +m[1] : null, book_id: +(e.getAttribute('book') || 0) || null}; }).sort((a, b) => (a.i ?? 0) - (b.i ?? 0)))(rowEls) : rowEls.map(e => { const m = /\[([\d,]+)\]/.exec(e.textContent || '');
    const ls = [...e.querySelectorAll('*')].filter(x => x.children.length === 0).map(x => (x.textContent || '').replace(/\[[\d,]+\]/, '').trim()).filter(Boolean);
    return {title: ls[0] || '', author: ls[1] || '', n: +m[1].replace(/,/g, '')}; });
  const all = [...area.querySelectorAll('*')]; const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -872,7 +877,7 @@ function Oz-AllBooks($total) {
     $before = $map.Count
     foreach ($b in @($cur.books)) {   # עמוד שמתחלף או רשימה שמתארכת – אותה שורה יכולה לחזור: המספר הגדול, לא סכום
       $k = [string]$b.title + '|' + [string]$b.author
-      if ($map.Contains($k)) { if ([int]$b.n -gt [int]$map[$k].n) { $map[$k].n = [int]$b.n } } else { $map[$k] = @{ title = $b.title; author = $b.author; n = [int]$b.n } }
+      if ($map.Contains($k)) { if ([int]$b.n -gt [int]$map[$k].n) { $map[$k].n = [int]$b.n } } else { $map[$k] = @{ title = $b.title; author = $b.author; n = [int]$b.n; i = $b.i; book_id = $b.book_id } }
     }
     if ($map.Count -ne $before -or -not $steps) { $log += ('+' + ($map.Count - $before)) }
     if ($total -and $map.Count -ge $total) { break }
@@ -899,7 +904,8 @@ function Oz-AllBooks($total) {
   [void](Oz-Eval ($JS_BOOKS_PAGE + '(-1)'))
   $script:OzListDiag = @{ steps = $steps; log = ($log -join ','); rows = $first.rows; sc = $first.sc; tail = $cur.tail }
   $books = @(); $k = 0
-  foreach ($v in $map.Values) { $books += @{ idx = $k; title = $v.title; author = $v.author; n = $v.n }; $k++ }
+  $vals = @($map.Values); if (@($vals | Where-Object { $null -ne $_.i }).Count -eq $vals.Count) { $vals = @($vals | Sort-Object { [int]$_.i }) }   # (24.11) סדר האתר (רלוונטיות)
+  foreach ($v in $vals) { $one = @{ idx = $k; title = $v.title; author = $v.author; n = $v.n }; if ($v.book_id) { $one.book_id = $v.book_id }; $books += $one; $k++ }
   return $books
 }
 
@@ -934,7 +940,7 @@ function Oz-Search($q, $maxBooks) {
   if ($st.desc -match '([\d,]+)\s+תוצאות') { $count = [int]($matches[1] -replace ',', '') } elseif ($st.href -ne $before -or $saw) { $count = 0 }
   if ($st.desc -match '/\s*([\d,]+)\s+ספרים') { $nb = [int]($matches[1] -replace ',', '') }
   $books = @(); $k = 0
-  foreach ($b in @($st.books | Select-Object -First $maxBooks)) { $books += @{ idx = $k; title = $b.title; author = $b.author; n = $b.n }; $k++ }
+  foreach ($b in @($st.books | Select-Object -First $maxBooks)) { $one = @{ idx = $k; title = $b.title; author = $b.author; n = $b.n }; if ($b.book_id) { $one.book_id = $b.book_id }; $books += $one; $k++ }
   $script:OZ.books = $books; $script:OZ.lastq = $q
   return @{ count = $count; books_total = $nb; books = $books; desc = $st.desc }
 }
@@ -1246,7 +1252,7 @@ function Run-Batch($job) {
 # (מגרסה 136 התעלמות מ-remote-debugging-port בפרופיל ברירת המחדל), ולכן פרופיל נפרד של הגשר: הכניסה למנוי
 # נשמרת בו, במחשב בלבד. הלשוניות והחלונות של אסתר לא נוגעים.
 # החיפוש: אותו קוד של אוצר החכמה שבמחשב (Oz-Search, Oz-Pages) – האתר הוא אותה תוכנה; רק הדפדפן אחר.
-$script:OZO = @{ pid = 0; port = 0; tmp = $null; desk = [IntPtr]::Zero; cdp = $null; target = $null; last = [datetime]::MinValue; books = @(); login = 0 }
+$script:OZO = @{ pid = 0; port = 0; tmp = $null; desk = [IntPtr]::Zero; cdp = $null; target = $null; last = [datetime]::MinValue; books = @(); login = 0; lport = 0 }
 $OZO_URL = 'https://tablet.otzar.org/'
 $OZO_PROFILE = Join-Path $env:LOCALAPPDATA 'KtivBridge\otzar-online'
 
@@ -1271,8 +1277,8 @@ function Ozo-Close {
   if ($script:OZO.cdp) { try { $script:OZO.cdp.Dispose() } catch {} }
   if ($script:OZO.pid) { Ozo-Procs | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} } }
   if ($script:OZO.desk -ne [IntPtr]::Zero) { Start-Sleep -Milliseconds 800; [void][KB]::CloseDesk($script:OZO.desk) }
-  $login = $script:OZO.login
-  $script:OZO = @{ pid = 0; port = 0; tmp = $null; desk = [IntPtr]::Zero; cdp = $null; target = $null; last = [datetime]::MinValue; books = @(); login = $login }
+  $login = $script:OZO.login; $lport = $script:OZO.lport
+  $script:OZO = @{ pid = 0; port = 0; tmp = $null; desk = [IntPtr]::Zero; cdp = $null; target = $null; last = [datetime]::MinValue; books = @(); login = $login; lport = $lport }
 }
 
 function Ozo-Ensure {
@@ -1280,7 +1286,15 @@ function Ozo-Ensure {
   Ozo-Close
   $exe = Find-Chrome
   if (-not $exe) { return 'לא נמצא כרום או Edge במחשב' }
-  if (@(Ozo-Procs).Count) { return 'login-open' }   # חלון הכניסה למנוי עדיין פתוח: לא נוגעים בו
+  if (@(Ozo-Procs).Count) {   # חלון הכניסה למנוי עדיין פתוח
+    # (26.11) אחרי שנכנסו למנוי – הגשר סוגר את החלון בעצמו (קודם נשאר "פתוח" עד שסגרו אותו ידנית, וכל החיפושים חיכו)
+    if (-not (Ozo-LoginDone)) { return 'login-open' }
+    L 'אוצר החכמה המקוון: הכניסה למנוי הצליחה – סוגר את חלון הכניסה'
+    Ozo-Procs | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }
+    for ($i = 0; $i -lt 20 -and @(Ozo-Procs).Count; $i++) { Start-Sleep -Milliseconds 500 }
+    $script:OZO.lport = 0
+    if (@(Ozo-Procs).Count) { return 'login-open' }
+  }
   New-Item -ItemType Directory -Force -Path $OZO_PROFILE | Out-Null
   $port = Get-Random -Minimum 9400 -Maximum 9459
   $desk = [KB]::NewDesk('ktivbridge_w')
@@ -1330,9 +1344,29 @@ function Ozo-Login {
   if (((Get-Date) - [datetime]$script:OZO.login).TotalMinutes -lt 3 -and $script:OZO.login) { return }   # (23.11) היה פעם בשעה – אסתר סגרה חלון וחיכתה שעה לחדש
   $exe = Find-Chrome
   if (-not $exe) { return }
-  Start-Process -FilePath $exe -ArgumentList @('--user-data-dir="' + $OZO_PROFILE + '"', '--no-first-run', '--no-default-browser-check', '--new-window', $OZO_URL) | Out-Null
-  $script:OZO.login = Get-Date
+  # (26.11) עם פתח בקרה, כדי שהגשר יראה מתי הכניסה הצליחה ויסגור את החלון בעצמו (Ozo-LoginDone)
+  $lp = Get-Random -Minimum 9460 -Maximum 9499
+  Start-Process -FilePath $exe -ArgumentList @('--remote-debugging-port=' + $lp, '--user-data-dir="' + $OZO_PROFILE + '"', '--no-first-run', '--no-default-browser-check', '--new-window', $OZO_URL) | Out-Null
+  $script:OZO.login = Get-Date; $script:OZO.lport = $lp
   L 'אוצר החכמה המקוון: נפתח חלון כניסה למנוי (פעם אחת; אחרי הכניסה סוגרים את החלון)'
+}
+
+function Ozo-LoginDone {
+  # (26.11) האם בחלון הכניסה כבר נכנסו למנוי: בודקים בכל לשונית של אוצר החכמה בחלון (דרך פתח הבקרה שלו) שהמשתמש אינו אורח.
+  # חלון שנפתח בגרסה קודמת (בלי פתח בקרה) – אי אפשר לדעת: כמו קודם, מחכים שיסגרו אותו.
+  $lp = [int]$script:OZO.lport
+  if (-not $lp) { return $false }
+  try { $arr = (New-Object Net.WebClient).DownloadString('http://127.0.0.1:' + $lp + '/json/list') | ConvertFrom-Json } catch { return $false }
+  $js = $JS_STORE_SHIM + "`n" + '(() => { const s = window._store; const u = s && s.state.user; return !!(u && u.fullname && !/אורח/.test(u.fullname)); })()'
+  foreach ($t in @(@($arr) | ForEach-Object { $_ } | Where-Object { $_.type -eq 'page' -and $_.url -match 'otzar\.org' -and $_.webSocketDebuggerUrl })) {
+    $c = $null
+    try {
+      $c = [KB+Cdp]::new($t.webSocketDebuggerUrl)
+      $r = $c.Send('Runtime.evaluate', ('{"expression":' + [KB]::J($js) + ',"returnByValue":true}'), 8000) | ConvertFrom-Json
+      if ($r.result.result.value -eq $true) { return $true }
+    } catch {} finally { if ($c) { try { $c.Dispose() } catch {} } }
+  }
+  return $false
 }
 
 # 16.11 (אסתר: "לרוב די בחיפוש בתוך אותו ספר"): חיפוש רק בספרים ששמם כשם הספר שצוין – מסננים את רשימת הספרים
@@ -1360,6 +1394,43 @@ function Ozo-ListFilter([string]$name) {
   return $true
 }
 
+# (24.11) סוג החיפוש באתר (שדרוג 24.11): רגיל – לפי המילים שהוזנו (ברירת המחדל של הגשר: התחביר שלנו בנוי עליו); מורחב – שורשים והטיות;
+# חכם – הבנת השאלה, נרדפות ושורשים. וגם: סוגרים את חלונית "חדש בגרסה" שמכסה את המסך.
+$OZO_MODES = @{ regular = 'חיפוש רגיל'; extended = 'חיפוש מורחב'; smart = 'חיפוש חכם' }
+$JS_MODE = @'
+((want) => { const lab = () => ((document.querySelector('.nl-mode-label') || {}).textContent || '').trim();
+ if (!document.querySelector('.nl-mode-btn')) return 'nomode'; if (lab() === want) return 'ok';
+ if (document.querySelector('.nl-mode-btn.locked, .nl-mode-btn[aria-disabled="true"]')) return 'locked';   // (25.11) נעול כשספר פתוח בחלון
+ const items = () => [...document.querySelectorAll('.nl-mode-menu .nl-mode-item')];
+ if (!items().length) document.querySelector('.nl-mode-btn').click();
+ const it = items().find(a => ((a.querySelector('.nl-mode-item-title') || a).textContent || '').trim() === want);
+ if (!it) return 'noitem:' + items().map(a => (a.textContent || '').trim().slice(0, 20)).join('|'); it.click(); return 'clicked'; })
+'@
+function Ozo-Popups {
+  try { [void](Ozo-Eval '(() => { document.querySelectorAll("button.whatsnew-close").forEach(b => b.click()); setTimeout(() => document.querySelectorAll(".whatsnew-backdrop, iframe.whatsnew-iframe, button.whatsnew-close").forEach(e => e.remove()), 300); return "ok"; })()') } catch {}
+}
+function Ozo-SetMode([string]$mode) {
+  if (-not $mode) { $mode = 'regular' }
+  $want = $OZO_MODES[$mode]; if (-not $want) { throw ('סוג חיפוש לא מוכר: ' + $mode) }
+  for ($t = 0; $t -lt 3; $t++) {
+    $r = Ozo-Eval ($JS_MODE + '(' + [KB]::J($want) + ')')
+    if ($r -eq 'ok' -or $r -eq 'nomode') { return $r }
+    if ($r -eq 'locked') {
+      # (25.11) הכפתור נעול כל עוד ספר פתוח בחלון (שיחה אחרת פתחה ספר): חוזרים למסך הבית ומחכים שייפתח (עד 12 שנ')
+      [void](Ozo-Eval '(() => { const h = document.querySelector(".icon-home"); if (h) (h.closest("a, button, [role=button]") || h).click(); return "ok"; })()')
+      for ($w = 0; $w -lt 24; $w++) {
+        Start-Sleep -Milliseconds 500
+        if ((Ozo-Eval '(() => document.querySelector(".nl-mode-btn.locked, .nl-mode-btn[aria-disabled=\"true\"]") ? "locked" : "open")()') -eq 'open') { break }
+      }
+      continue
+    }
+    Start-Sleep -Milliseconds 700
+  }
+  $r = Ozo-Eval ($JS_MODE + '(' + [KB]::J($want) + ')')
+  if ($r -ne 'ok') { throw ('לא הצלחתי לבחור "' + $want + '" (' + $r + ')') }
+  return $r
+}
+
 function Otzar-Online($p) {
   $q = [string]$p.query
   if (-not $q.Trim()) { throw 'חסר הניסוח' }
@@ -1377,6 +1448,8 @@ function Otzar-Online($p) {
     Ozo-Login
     return @{ state = 'login'; message = 'צריך להיכנס פעם אחת לאוצר החכמה המקוון בחלון שנפתח במחשב'; diag = $gd }
   }
+  Ozo-Popups
+  $mode = [string]$p.mode; $modeR = Ozo-SetMode $mode
   # אותו קוד של אוצר החכמה שבמחשב, על הדפדפן של האתר
   $saved = $script:OZ; $script:OZ = $script:OZO
   $scoped = $false
@@ -1410,7 +1483,7 @@ function Otzar-Online($p) {
     if ($pref.Length -ge 3 -and -not $idx.Count) { $r.prefer_found = 'לא נמצא ברשימה' }
     for ($i = 0; $i -lt @($script:OZ.books).Count -and $idx.Count -lt $n; $i++) { if ($idx -notcontains $i) { $idx += $i } }
     $pages = @(); if ($idx.Count) { $pages = @(Oz-Pages $idx 'text') }
-    $out = @{ state = 'ok'; count = $r.count; books_total = $r.books_total; books = @($r.books); pages = $pages; in_book = [bool]$r.in_book; list_diag = $r.list_diag; prefer_found = $r.prefer_found }
+    $out = @{ state = 'ok'; count = $r.count; books_total = $r.books_total; books = @($r.books); pages = $pages; in_book = [bool]$r.in_book; list_diag = $r.list_diag; prefer_found = $r.prefer_found; mode = $(if ($mode) { $mode } else { 'regular' }); mode_state = $modeR }
   } finally {
     if ($scoped) { try { [void](Ozo-Eval ($JS_SCOPE + '(' + [KB]::J('בכל הספרים') + ')')); [void](Ozo-ListFilter '') } catch {} }
     $script:OZO = $script:OZ; $script:OZ = $saved
@@ -1459,12 +1532,14 @@ function Otzar-Online-Pages($p) {
     if (-not $guest) { break }; Start-Sleep -Milliseconds 500
   }
   if ($guest) { Ozo-Login; return @{ state = 'login'; message = 'צריך להיכנס פעם אחת לאוצר החכמה המקוון בחלון שנפתח במחשב' } }
+  Ozo-Popups
   $saved = $script:OZ; $script:OZ = $script:OZO
   $pages = @(); $title = ''
   try {
     $cur = Oz-PageState
     if ([int]$cur.book -ne $book) {
       if (-not $q.Trim()) { return @{ state = 'error'; message = 'הספר לא פתוח – צריך את הניסוח שמצא אותו (query)' } }
+      [void](Ozo-SetMode ([string]$p.mode))
       $r = Oz-Search $q 40; $ok = $false
       for ($i = 0; $i -lt [Math]::Min(8, @($r.books).Count); $i++) {
         try { $pg = Oz-OpenBook $i; if ([int]$pg.book_id -eq $book) { $ok = $true; $title = [string]$r.books[$i].title; break } } catch { L ('דפדוף: פתיחת ספר ' + $i + ': ' + $_) }
@@ -1490,12 +1565,95 @@ function Otzar-Online-Pages($p) {
   return @{ state = 'ok'; book_id = $book; title = $title; pages = $pages }
 }
 
+# (24.11, שיחת אוצר-בינה) בדיקת מבנה האתר אחרי שדרוג (סוגי חיפוש, "שאל את האוצר", רשימה חדשה) – פעולות קבועות בלבד, בלי קוד חופשי:
+# scan / find (ביטוי) / dump (בורר) / click (טקסט) / clicksel (בורר) / type (+ sel) / key / wait / search / shot
+$JS_PROBE = @'
+((st) => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+ const cl = e => typeof e.className === 'string' ? e.className : ((e.className && e.className.baseVal) || '');
+ const d = e => { if (!e) return null; const r = e.getBoundingClientRect(); const path = [];
+   for (let p = e.parentElement, i = 0; p && i < 5; p = p.parentElement, i++) path.push(p.tagName.toLowerCase() + (p.id ? '#' + p.id : '') + (cl(p) ? '.' + cl(p).trim().split(/\s+/).slice(0, 3).join('.') : ''));
+   return {tag: e.tagName.toLowerCase(), id: e.id || '', cls: cl(e).slice(0, 140), txt: (e.innerText || e.value || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+     ph: e.placeholder || '', aria: (e.getAttribute && e.getAttribute('aria-label')) || '', title: (e.getAttribute && e.getAttribute('title')) || '',
+     x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), vis: vis(e), path: path}; };
+ const leaf = re => [...document.querySelectorAll('body *')].filter(e => re.test(e.textContent || '') && ![...e.children].some(c => re.test(c.textContent || '')));
+ const byText = t => { const all = [...document.querySelectorAll('body *')].filter(vis);
+   let c = all.filter(e => (e.innerText || '').trim() === t); if (!c.length) c = all.filter(e => (e.innerText || '').includes(t) || (e.getAttribute('title') || '') === t || (e.getAttribute('aria-label') || '') === t || (e.placeholder || '') === t);
+   c.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length); return c[0]; };
+ if (st.scan) return JSON.stringify({href: location.href, vw: innerWidth, vh: innerHeight,
+   inputs: [...document.querySelectorAll('input, textarea, [contenteditable=true]')].filter(vis).slice(0, 25).map(d),
+   top: [...document.querySelectorAll('button, [role=button], a, .btn, [class*=icon]')].filter(vis).filter(e => e.getBoundingClientRect().y < 340).slice(0, 80).map(d),
+   modes: leaf(/חיפוש (מורחב|חכם|רגיל)/).slice(0, 12).map(d), ask: leaf(/שאל את האוצר|שאל שאלה|בשפה חופשית/).slice(0, 12).map(d),
+   desc: leaf(/תוצאות ב/).slice(0, 6).map(d), area: d(document.querySelector('.free-search-area'))});
+ if (st.find) return JSON.stringify(leaf(new RegExp(st.find)).slice(0, st.n || 20).map(d));
+ if (st.dump) { const els = [...document.querySelectorAll(st.dump)]; const e = els.find(vis) || els[0];
+   return JSON.stringify({count: els.length, el: d(e), html: e ? e.outerHTML.replace(/\s+/g, ' ').slice(0, st.n || 9000) : '', text: e ? (e.innerText || '').slice(0, st.n || 9000) : ''}); }
+ if (st.click || st.clicksel) { const e = st.click ? byText(st.click) : [...document.querySelectorAll(st.clicksel)].find(vis);
+   if (!e) return JSON.stringify({clicked: false}); e.scrollIntoView({block: 'center'}); (e.closest('button, a, li, [role=button], [role=option]') || e).click(); return JSON.stringify({clicked: true, el: d(e)}); }
+ if (st.setval) { const e = [...document.querySelectorAll(st.setval)].find(vis) || document.querySelector(st.setval); if (!e) return JSON.stringify({set: false});
+   const proto = e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; Object.getOwnPropertyDescriptor(proto, 'value').set.call(e, st.value || '');
+   e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); return JSON.stringify({set: true, value: e.value.length}); }
+ if (st.focus) { const e = [...document.querySelectorAll(st.focus)].find(vis); if (!e) return JSON.stringify({focused: false}); e.focus(); if (e.select) e.select(); return JSON.stringify({focused: true, el: d(e)}); }
+ if (st.shotrect) { const e = [...document.querySelectorAll(st.shotrect)].find(vis); if (!e) return 'null'; const r = e.getBoundingClientRect(); return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height}); }
+ return 'null'; })
+'@
+
+function Otzar-Online-Probe($p) {
+  $e = Ozo-Ensure
+  if ($e -ne 'ok') { return @{ state = 'error'; message = $e } }
+  $saved = $script:OZ; $script:OZ = $script:OZO
+  $out = @()
+  try {
+    foreach ($s in @($p.steps | Select-Object -First 40)) {
+      try {
+        if ($s.wait) { Start-Sleep -Milliseconds ([int]([Math]::Min([double]$s.wait, 120) * 1000)); $out += @{ wait = $s.wait }; continue }
+        if ($s.search) { $r = Oz-Search ([string]$s.search) 40; $out += @{ search = $s.search; count = $r.count; books_total = $r.books_total; books = @($r.books).Count; desc = $r.desc }; continue }
+        if ($s.drag) {   # גרירת עכבר [x1,y1,x2,y2] (בחירת אזור בעמוד)
+          $d = @($s.drag); $ax = [int]$d[0]; $ay = [int]$d[1]; $bx = [int]$d[2]; $by = [int]$d[3]
+          [void](Oz-Send 'Input.dispatchMouseEvent' ('{"type":"mouseMoved","x":' + $ax + ',"y":' + $ay + '}'))
+          [void](Oz-Send 'Input.dispatchMouseEvent' ('{"type":"mousePressed","x":' + $ax + ',"y":' + $ay + ',"button":"left","buttons":1,"clickCount":1}'))
+          for ($k = 1; $k -le 10; $k++) { [void](Oz-Send 'Input.dispatchMouseEvent' ('{"type":"mouseMoved","x":' + [int]($ax + ($bx - $ax) * $k / 10) + ',"y":' + [int]($ay + ($by - $ay) * $k / 10) + ',"button":"left","buttons":1}')) }
+          [void](Oz-Send 'Input.dispatchMouseEvent' ('{"type":"mouseReleased","x":' + $bx + ',"y":' + $by + ',"button":"left","buttons":0,"clickCount":1}'))
+          $out += @{ drag = $d }; continue
+        }
+        if ($s.pagestate) { $out += @{ pagestate = (Oz-PageState) }; continue }
+        if ($s.viewport) { $vp = @($s.viewport); [void](Oz-Send 'Emulation.setDeviceMetricsOverride' ('{"width":' + [int]$vp[0] + ',"height":' + [int]$vp[1] + ',"deviceScaleFactor":1.5,"mobile":false}')); $out += @{ viewport = $vp }; continue }
+        if ($s.mouse) {   # לחיצת עכבר אמיתית במרכז האלמנט (כפתורים שלא מגיבים ל-click)
+          $rj = Oz-Eval ($JS_PROBE + '(' + (@{ shotrect = [string]$s.mouse } | ConvertTo-Json -Compress) + ')')
+          if (-not $rj -or $rj -eq 'null') { $out += @{ mouse = $s.mouse; found = $false }; continue }
+          $rc = $rj | ConvertFrom-Json; $mx = [Math]::Round([double]$rc.x + [double]$rc.w / 2); $my = [Math]::Round([double]$rc.y + [double]$rc.h / 2)
+          foreach ($t in @('mouseMoved', 'mousePressed', 'mouseReleased')) { [void](Oz-Send 'Input.dispatchMouseEvent' ('{"type":"' + $t + '","x":' + $mx + ',"y":' + $my + ',"button":"left","clickCount":1}')) }
+          $out += @{ mouse = $s.mouse; x = $mx; y = $my }; continue
+        }
+        if ($s.type) { [void](Oz-Send 'Input.insertText' ('{"text":' + [KB]::J([string]$s.type) + '}')); $out += @{ typed = ([string]$s.type).Length }; continue }
+        if ($s.key) {
+          $k = [string]$s.key; $vk = $(if ($k -eq 'Enter') { 13 } elseif ($k -eq 'Escape') { 27 } else { 0 })
+          [void](Oz-Send 'Input.dispatchKeyEvent' ('{"type":"rawKeyDown","key":' + [KB]::J($k) + ',"code":' + [KB]::J($k) + ',"windowsVirtualKeyCode":' + $vk + '}'))
+          if ($k -eq 'Enter') { [void](Oz-Send 'Input.dispatchKeyEvent' '{"type":"char","key":"Enter","text":"\r","unmodifiedText":"\r","windowsVirtualKeyCode":13}') }
+          [void](Oz-Send 'Input.dispatchKeyEvent' ('{"type":"keyUp","key":' + [KB]::J($k) + ',"code":' + [KB]::J($k) + ',"windowsVirtualKeyCode":' + $vk + '}'))
+          $out += @{ key = $k }; continue
+        }
+        if ($s.shot) {
+          $rect = $null
+          if ($s.shot -is [string]) { $rj = Oz-Eval ($JS_PROBE + '(' + (@{ shotrect = [string]$s.shot } | ConvertTo-Json -Compress) + ')'); if ($rj -and $rj -ne 'null') { $rect = $rj | ConvertFrom-Json } }
+          if (-not $rect) { $rect = @{ x = 0; y = 0; w = 1280; h = 1000 } }
+          $b = Oz-Shot $rect 0.7; $out += @{ shot = [Convert]::ToBase64String($b) }; continue
+        }
+        $j = Oz-Eval ($JS_PROBE + '(' + ($s | ConvertTo-Json -Compress -Depth 4) + ')')
+        $out += @{ step = $s; r = $(if ($j) { $j | ConvertFrom-Json } else { $null }) }
+      } catch { $out += @{ step = $s; error = [string]$_ } }
+    }
+  } finally { $script:OZO = $script:OZ; $script:OZ = $saved }
+  $script:OZO.last = Get-Date
+  return @{ state = 'ok'; steps = $out }
+}
+
 function Run-Job($job) {
   switch ($job.kind) {
     'batch' { return (Run-Batch $job) }
     'otzar_books' { return (Otzar-Books $job.params) }
     'otzar_online' { return (Otzar-Online $job.params) }
     'otzar_online_pages' { return (Otzar-Online-Pages $job.params) }
+    'otzar_online_probe' { return (Otzar-Online-Probe $job.params) }
     'close' { Oz-Close; Ozo-Close; [KB]::ResponsaClose(); [KB]::DbsClose(); return @{ ok = $true } }
     'selftest' { return @{ version = $VERSION; caps = (Caps) } }
     default { throw ('סוג משימה לא מוכר: ' + $job.kind) }
